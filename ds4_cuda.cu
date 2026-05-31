@@ -126,8 +126,8 @@ static cudaStream_t ds4_decode_stream(void) {
 static cudaGraph_t g_cuda_decode_graph;
 static cudaGraphExec_t g_cuda_decode_graph_exec;
 static int g_cuda_decode_graph_captured;
-static cudaGraphExec_t g_sub_graph_exec[2][43];
-static int g_sub_graph_exec_ready[2][43];
+static cudaGraphExec_t g_sub_graph_exec[2][DS4_GPU_MAX_LAYER];
+static int g_sub_graph_exec_ready[2][DS4_GPU_MAX_LAYER];
 static cudaGraph_t g_pp_chunk_graph[DS4_CUDA_MAX_DEVICES];
 static cudaGraphExec_t g_pp_chunk_graph_exec[DS4_CUDA_MAX_DEVICES];
 static int g_pp_chunk_graph_ready[DS4_CUDA_MAX_DEVICES];
@@ -136,8 +136,8 @@ typedef struct {
     cudaGraphNode_t node;
     cudaKernelNodeParams params;
 } local_kernel_patch;
-static local_kernel_patch g_local_patches[2][43][16];
-static int g_graph_patch_count[2][43];
+static local_kernel_patch g_local_patches[2][DS4_GPU_MAX_LAYER][16];
+static int g_graph_patch_count[2][DS4_GPU_MAX_LAYER];
 static int g_decode_graph_capture_disabled_notice_printed;
 
 static int cuda_model_direct_host_access_allowed(void);
@@ -260,7 +260,7 @@ extern "C" int ds4_gpu_decode_graph_capture_end_store(int part, int layer) {
         if (ce != cudaSuccess) (void)cudaGetLastError();
         return 0;
     }
-    if (layer >= 43 || !g_cuda_decode_stream_created) return 0;
+    if (layer >= DS4_GPU_MAX_LAYER || !g_cuda_decode_stream_created) return 0;
     cudaGraph_t graph = NULL;
     cudaError_t ce = cudaStreamEndCapture(g_cuda_decode_stream, &graph);
     if (ce != cudaSuccess || !graph) {
@@ -297,7 +297,7 @@ extern "C" int ds4_gpu_decode_graph_capture_end_store(int part, int layer) {
 }
 
 extern "C" int ds4_gpu_decode_subgraph_launch(int part, int layer) {
-    if (layer < 0 || layer >= 43 || !g_sub_graph_exec[part][layer]) return 0;
+    if (layer < 0 || layer >= DS4_GPU_MAX_LAYER || !g_sub_graph_exec[part][layer]) return 0;
     return cudaGraphLaunch(g_sub_graph_exec[part][layer], ds4_decode_stream()) == cudaSuccess ? 1 : 0;
 }
 
@@ -416,7 +416,7 @@ extern "C" int ds4_gpu_decode_graph_patch_post(int layer, uint32_t pos) {
 }
 
 extern "C" int ds4_gpu_decode_subgraphs_ready(void) {
-    for (int p = 0; p < 2; p++) for (int i = 0; i < 43; i++) if (!g_sub_graph_exec_ready[p][i]) return 0;
+    for (int p = 0; p < 2; p++) for (int i = 0; i < DS4_GPU_MAX_LAYER; i++) if (!g_sub_graph_exec_ready[p][i]) return 0;
     return 1;
 }
 
@@ -594,10 +594,13 @@ static int g_pp_resident_ready;
  * each layer. Logical device g -> stage g/g_tp_degree, rank g%g_tp_degree. When
  * g_tp_degree<=1, TP is OFF and the PP path is byte-for-byte unchanged. */
 static int g_tp_degree;
-static int g_pp_layer_start[7];
-static int g_pp_layer_end[7];
-static float *g_pp_active[7];
-static ncclComm_t g_pp_nccl_comms[7];
+static int g_pp_layer_start[DS4_CUDA_MAX_DEVICES];
+static int g_pp_layer_end[DS4_CUDA_MAX_DEVICES];
+static float *g_pp_active[DS4_CUDA_MAX_DEVICES];
+static ncclComm_t g_pp_nccl_comms[DS4_CUDA_MAX_DEVICES];
+/* Model shape passed from ds4.c (the .cu cannot see g_ds4_shape macros). */
+static int g_model_n_layer = 43;
+static int g_model_n_embd = 4096;
 static int g_pp_nccl_ready;
 static cudaEvent_t g_pp_event[DS4_CUDA_MAX_DEVICES];
 static cudaEvent_t g_pp_copy_event[DS4_CUDA_MAX_DEVICES];
@@ -2112,7 +2115,7 @@ static int ds4_gpu_pp_init(void) {
     g_tp_degree = g_tp;
     const int nstage = ngpu / g_tp;
 
-    int total_layers = 43;
+    int total_layers = g_model_n_layer;
     const char *split_env = getenv("DS4_CUDA_PP_LAYER_SPLIT");
     int stage_start[16] = {0}, stage_end[16] = {0};
     int have_split = 0;
@@ -2159,7 +2162,7 @@ static int ds4_gpu_pp_init(void) {
     }
     for (int g = 0; g < ngpu; g++) {
         cudaSetDevice(g);
-        if (cudaMalloc(&g_pp_active[g], 4 * 4096 * sizeof(float)) != cudaSuccess) {
+        if (cudaMalloc(&g_pp_active[g], 4 * g_model_n_embd * sizeof(float)) != cudaSuccess) {
             (void)cudaGetLastError(); ok = 0;
         }
     }
@@ -2216,6 +2219,8 @@ static int ds4_gpu_pp_init(void) {
 }
 
 /* PP export API */
+extern "C" void ds4_gpu_set_n_layer(uint32_t n) { if (n > 0u) g_model_n_layer = (int)n; }
+extern "C" void ds4_gpu_set_n_embd(uint32_t n) { if (n > 0u) g_model_n_embd = (int)n; }
 extern "C" int ds4_gpu_pp_set_device(int g) {
     cudaSetDevice(g); return 1;
 }
@@ -2249,7 +2254,7 @@ extern "C" int ds4_gpu_pp_p2p_copy(int dst_gpu, int src_gpu) {
     if (dst_gpu < 0 || dst_gpu >= g_pp_ngpu || src_gpu < 0 || src_gpu >= g_pp_ngpu) return 0;
     cudaError_t ce = cudaMemcpyPeer(g_pp_active[dst_gpu], dst_gpu,
                                      g_pp_active[src_gpu], src_gpu,
-                                     4 * 4096 * sizeof(float));
+                                     4 * g_model_n_embd * sizeof(float));
     return ce == cudaSuccess ? 1 : 0;
 }
 
@@ -2765,7 +2770,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         }
         g_pp_chunk_graph_ready[g] = 0;
     }
-    for (int p = 0; p < 2; p++) for (int i = 0; i < 43; i++) {
+    for (int p = 0; p < 2; p++) for (int i = 0; i < DS4_GPU_MAX_LAYER; i++) {
         if (g_sub_graph_exec[p][i]) { (void)cudaGraphExecDestroy(g_sub_graph_exec[p][i]); g_sub_graph_exec[p][i] = NULL; }
         g_sub_graph_exec_ready[p][i] = 0;
     }
@@ -5823,30 +5828,33 @@ __global__ static void router_select_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        float expert_weight_scale) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
     int32_t token = ds4_cuda_params_active ? ds4_cuda_dev_params.token : token_scalar;
-    const float *log = logits + (uint64_t)t * 256;
-    float *prob = probs + (uint64_t)t * 256;
-    int32_t *sel = selected + (uint64_t)t * 6;
-    float *w = weights + (uint64_t)t * 6;
+    const float *log = logits + (uint64_t)t * n_expert;
+    float *prob = probs + (uint64_t)t * n_expert;
+    int32_t *sel = selected + (uint64_t)t * n_expert_used;
+    float *w = weights + (uint64_t)t * n_expert_used;
 
-    for (int i = 0; i < 256; i++) prob[i] = sqrtf(softplus_dev(log[i]));
+    for (uint32_t i = 0; i < n_expert; i++) prob[i] = sqrtf(softplus_dev(log[i]));
 
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token;
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-        const int32_t *row = hash + (uint64_t)tok * 6;
-        for (int i = 0; i < 6; i++) sel[i] = row[i];
+        const int32_t *row = hash + (uint64_t)tok * n_expert_used;
+        for (uint32_t i = 0; i < n_expert_used; i++) sel[i] = row[i];
     } else {
-        for (int i = 0; i < 6; i++) sel[i] = -1;
-        for (int i = 0; i < 256; i++) {
+        for (uint32_t i = 0; i < n_expert_used; i++) sel[i] = -1;
+        for (uint32_t i = 0; i < n_expert; i++) {
             float score = prob[i] + (has_bias ? bias[i] : 0.0f);
-            for (int j = 0; j < 6; j++) {
+            for (uint32_t j = 0; j < n_expert_used; j++) {
                 if (sel[j] < 0 || score > prob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
-                    for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
-                    sel[j] = i;
+                    for (uint32_t k = n_expert_used - 1; k > j; k--) sel[k] = sel[k - 1];
+                    sel[j] = (int32_t)i;
                     break;
                 }
             }
@@ -5854,14 +5862,14 @@ __global__ static void router_select_kernel(
     }
 
     float sum = 0.0f;
-    for (int i = 0; i < 6; i++) {
+    for (uint32_t i = 0; i < n_expert_used; i++) {
         int e = sel[i];
-        float v = (e >= 0 && e < 256) ? prob[e] : 0.0f;
+        float v = (e >= 0 && e < (int32_t)n_expert) ? prob[e] : 0.0f;
         w[i] = v;
         sum += v;
     }
     sum = fmaxf(sum, 6.103515625e-5f);
-    for (int i = 0; i < 6; i++) w[i] = w[i] / sum * 1.5f;
+    for (uint32_t i = 0; i < n_expert_used; i++) w[i] = w[i] / sum * expert_weight_scale;
 }
 
 __global__ static void router_select_parallel_kernel(
@@ -5876,15 +5884,18 @@ __global__ static void router_select_parallel_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        float expert_weight_scale) {
     uint32_t t = blockIdx.x;
     uint32_t i = threadIdx.x;
-    if (t >= n_tokens || i >= 256u) return;
-    const float *log = logits + (uint64_t)t * 256;
-    float *prob = probs + (uint64_t)t * 256;
-    int32_t *sel = selected + (uint64_t)t * 6;
-    float *w = weights + (uint64_t)t * 6;
-    __shared__ float sprob[256];
+    if (t >= n_tokens || i >= n_expert) return;
+    const float *log = logits + (uint64_t)t * n_expert;
+    float *prob = probs + (uint64_t)t * n_expert;
+    int32_t *sel = selected + (uint64_t)t * n_expert_used;
+    float *w = weights + (uint64_t)t * n_expert_used;
+    __shared__ float sprob[384];
 
     const float p = sqrtf(softplus_dev(log[i]));
     sprob[i] = p;
@@ -5895,16 +5906,16 @@ __global__ static void router_select_parallel_kernel(
     if (hash_mode) {
         int32_t tok = tokens ? tokens[t] : token_scalar;
         if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-        const int32_t *row = hash + (uint64_t)tok * 6;
-        for (int j = 0; j < 6; j++) sel[j] = row[j];
+        const int32_t *row = hash + (uint64_t)tok * n_expert_used;
+        for (uint32_t j = 0; j < n_expert_used; j++) sel[j] = row[j];
     } else {
-        for (int j = 0; j < 6; j++) sel[j] = -1;
-        for (int e = 0; e < 256; e++) {
+        for (uint32_t j = 0; j < n_expert_used; j++) sel[j] = -1;
+        for (uint32_t e = 0; e < n_expert; e++) {
             float score = sprob[e] + (has_bias ? bias[e] : 0.0f);
-            for (int j = 0; j < 6; j++) {
+            for (uint32_t j = 0; j < n_expert_used; j++) {
                 if (sel[j] < 0 || score > sprob[sel[j]] + (has_bias ? bias[sel[j]] : 0.0f)) {
-                    for (int k = 5; k > j; k--) sel[k] = sel[k - 1];
-                    sel[j] = e;
+                    for (uint32_t k = n_expert_used - 1; k > j; k--) sel[k] = sel[k - 1];
+                    sel[j] = (int32_t)e;
                     break;
                 }
             }
@@ -5912,14 +5923,14 @@ __global__ static void router_select_parallel_kernel(
     }
 
     float sum = 0.0f;
-    for (int j = 0; j < 6; j++) {
+    for (uint32_t j = 0; j < n_expert_used; j++) {
         int e = sel[j];
-        float v = (e >= 0 && e < 256) ? sprob[e] : 0.0f;
+        float v = (e >= 0 && e < (int32_t)n_expert) ? sprob[e] : 0.0f;
         w[j] = v;
         sum += v;
     }
     sum = fmaxf(sum, 6.103515625e-5f);
-    for (int j = 0; j < 6; j++) w[j] = w[j] / sum * 1.5f;
+    for (uint32_t j = 0; j < n_expert_used; j++) w[j] = w[j] / sum * expert_weight_scale;
 }
 
 __device__ __forceinline__ static bool router_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
@@ -5938,28 +5949,35 @@ __global__ static void router_select_warp_topk_kernel(
         uint32_t hash_rows,
         uint32_t n_tokens,
         int has_bias,
-        int hash_mode) {
+        int hash_mode,
+        uint32_t n_expert,
+        uint32_t n_expert_used,
+        float expert_weight_scale) {
     const uint32_t lane = threadIdx.x;
     const uint32_t row_in_block = threadIdx.y;
     const uint32_t t = blockIdx.x * blockDim.y + row_in_block;
     if (t >= n_tokens || lane >= 32u) return;
 
-    const float *log = logits + (uint64_t)t * 256u;
-    float *prob = probs + (uint64_t)t * 256u;
-    int32_t *sel = selected + (uint64_t)t * 6u;
-    float *w = weights + (uint64_t)t * 6u;
-    __shared__ float sprob[4][256];
-    float local_prob[8];
-    float local_score[8];
+    const float *log = logits + (uint64_t)t * n_expert;
+    float *prob = probs + (uint64_t)t * n_expert;
+    int32_t *sel = selected + (uint64_t)t * n_expert_used;
+    float *w = weights + (uint64_t)t * n_expert_used;
+    __shared__ float sprob[4][384];
+    float local_prob[12];
+    float local_score[12];
 
-    #pragma unroll
-    for (uint32_t j = 0; j < 8u; j++) {
+    for (uint32_t j = 0; j * 32u < n_expert; j++) {
         const uint32_t e = lane + j * 32u;
-        const float p = sqrtf(softplus_dev(log[e]));
-        local_prob[j] = p;
-        local_score[j] = p + (has_bias ? bias[e] : 0.0f);
-        sprob[row_in_block][e] = p;
-        prob[e] = p;
+        if (e < n_expert) {
+            const float p = sqrtf(softplus_dev(log[e]));
+            local_prob[j] = p;
+            local_score[j] = p + (has_bias ? bias[e] : 0.0f);
+            sprob[row_in_block][e] = p;
+            prob[e] = p;
+        } else {
+            local_prob[j] = 0.0f;
+            local_score[j] = -INFINITY;
+        }
     }
     __syncwarp();
 
@@ -5968,32 +5986,28 @@ __global__ static void router_select_warp_topk_kernel(
         int32_t tok = ds4_cuda_params_active ? ds4_cuda_dev_params.token :
                         (tokens ? tokens[t] : token_scalar);
             if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;
-            const int32_t *row = hash + (uint64_t)tok * 6u;
+            const int32_t *row = hash + (uint64_t)tok * n_expert_used;
             float sum = 0.0f;
-            #pragma unroll
-            for (uint32_t j = 0; j < 6u; j++) {
+            for (uint32_t j = 0; j < n_expert_used; j++) {
                 const int32_t e = row[j];
                 sel[j] = e;
-                const float v = (e >= 0 && e < 256) ? sprob[row_in_block][(uint32_t)e] : 0.0f;
+                const float v = (e >= 0 && e < (int32_t)n_expert) ? sprob[row_in_block][(uint32_t)e] : 0.0f;
                 w[j] = v;
                 sum += v;
             }
             sum = fmaxf(sum, 6.103515625e-5f);
-            #pragma unroll
-            for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+            for (uint32_t j = 0; j < n_expert_used; j++) w[j] = w[j] / sum * expert_weight_scale;
         }
         return;
     }
 
     float out_prob[6] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     uint32_t out_idx[6] = {0, 0, 0, 0, 0, 0};
-    #pragma unroll
-    for (uint32_t k = 0; k < 6u; k++) {
+    for (uint32_t k = 0; k < n_expert_used; k++) {
         float best_score = -INFINITY;
         float best_prob = 0.0f;
         uint32_t best_idx = UINT32_MAX;
-        #pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) {
+        for (uint32_t j = 0; j * 32u < n_expert; j++) {
             const uint32_t e = lane + j * 32u;
             const float s = local_score[j];
             if (router_score_better(s, e, best_score, best_idx)) {
@@ -6013,8 +6027,7 @@ __global__ static void router_select_warp_topk_kernel(
                 best_idx = other_idx;
             }
         }
-        #pragma unroll
-        for (uint32_t j = 0; j < 8u; j++) {
+        for (uint32_t j = 0; j * 32u < n_expert; j++) {
             const uint32_t e = lane + j * 32u;
             if (e == best_idx) local_score[j] = -INFINITY;
         }
@@ -6026,15 +6039,13 @@ __global__ static void router_select_warp_topk_kernel(
 
     if (lane == 0) {
         float sum = 0.0f;
-        #pragma unroll
-        for (uint32_t j = 0; j < 6u; j++) {
+        for (uint32_t j = 0; j < n_expert_used; j++) {
             sel[j] = (int32_t)out_idx[j];
             w[j] = out_prob[j];
             sum += out_prob[j];
         }
         sum = fmaxf(sum, 6.103515625e-5f);
-        #pragma unroll
-        for (uint32_t j = 0; j < 6u; j++) w[j] = w[j] / sum * 1.5f;
+        for (uint32_t j = 0; j < n_expert_used; j++) w[j] = w[j] / sum * expert_weight_scale;
     }
 }
 
@@ -10153,14 +10164,14 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
 }
 extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t token, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits) {
     if (!selected || !weights || !probs || !logits || !model_map || n_expert_groups > 1u || n_group_used > 0u) return 0;
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if ((n_expert != 256u && n_expert != 384u) || n_expert_used != 6u) return 0;
     int32_t tok = (int32_t)token;
     int ok = 1;
     const float *bias = NULL;
     const int32_t *hash = NULL;
     if (ok && has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) ok = 0;
-        else bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
+        if (bias_offset > model_size || model_size - bias_offset < (uint64_t)n_expert * sizeof(float)) ok = 0;
+        else bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * sizeof(float), "router_bias");
         if (!bias) ok = 0;
     }
     if (ok && hash_mode) {
@@ -10175,26 +10186,26 @@ extern "C" int ds4_gpu_router_select_tensor(ds4_gpu_tensor *selected, ds4_gpu_te
             dim3 block(32, 4, 1);
             router_select_warp_topk_kernel<<<1, block, 0, ds4_decode_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                          bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                         has_bias && !hash_mode, hash_mode);
+                                                         has_bias && !hash_mode, hash_mode, n_expert, n_expert_used, expert_weight_scale);
         } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
-            router_select_parallel_kernel<<<1, 256, 0, ds4_decode_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+            router_select_parallel_kernel<<<1, 384, 0, ds4_decode_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                                       bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                                      has_bias && !hash_mode, hash_mode);
+                                                      has_bias && !hash_mode, hash_mode, n_expert, n_expert_used, expert_weight_scale);
         } else {
             router_select_kernel<<<1, 1, 0, ds4_decode_stream()>>>((int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
                                           bias, hash, (const float *)logits->ptr, NULL, tok, hash_rows, 1,
-                                          has_bias && !hash_mode, hash_mode);
+                                          has_bias && !hash_mode, hash_mode, n_expert, n_expert_used, expert_weight_scale);
         }
         ok = cuda_ok(cudaGetLastError(), "router_select launch");
     }
     return ok;
 }
 extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_gpu_tensor *weights, ds4_gpu_tensor *probs, const void *model_map, uint64_t model_size, uint64_t bias_offset, uint64_t hash_offset, uint32_t hash_rows, uint32_t n_expert_groups, uint32_t n_group_used, bool has_bias, bool hash_mode, const ds4_gpu_tensor *logits, const ds4_gpu_tensor *tokens, uint32_t n_expert, uint32_t n_expert_used, float expert_weight_scale, uint32_t n_tokens) {
-    if (n_expert != 256u || n_expert_used != 6u || fabsf(expert_weight_scale - 1.5f) > 1.0e-6f) return 0;
+    if ((n_expert != 256u && n_expert != 384u) || n_expert_used != 6u) return 0;
     if (!selected || !weights || !probs || !logits || !tokens || !model_map || n_tokens == 0 ||
         n_expert_groups > 1u || n_group_used > 0u ||
-        logits->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
-        probs->bytes < (uint64_t)n_tokens * 256u * sizeof(float) ||
+        logits->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
+        probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * 6u * sizeof(int32_t) ||
         weights->bytes < (uint64_t)n_tokens * 6u * sizeof(float)) {
         return 0;
@@ -10202,8 +10213,8 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
     const float *bias = NULL;
     const int32_t *hash = NULL;
     if (has_bias && !hash_mode) {
-        if (bias_offset > model_size || model_size - bias_offset < 256u * sizeof(float)) return 0;
-        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, 256u * sizeof(float), "router_bias");
+        if (bias_offset > model_size || model_size - bias_offset < (uint64_t)n_expert * sizeof(float)) return 0;
+        bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, (uint64_t)n_expert * sizeof(float), "router_bias");
         if (!bias) return 0;
     }
     if (hash_mode) {
@@ -10226,9 +10237,9 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                                         hash_rows,
                                                                         n_tokens,
                                                                         has_bias && !hash_mode,
-                                                                        hash_mode);
+                                                                        hash_mode, n_expert, n_expert_used, expert_weight_scale);
     } else if (getenv("DS4_CUDA_NO_PARALLEL_ROUTER_SELECT") == NULL) {
-        router_select_parallel_kernel<<<n_tokens, 256, 0, ds4_decode_stream()>>>((int32_t *)selected->ptr,
+        router_select_parallel_kernel<<<n_tokens, 384, 0, ds4_decode_stream()>>>((int32_t *)selected->ptr,
                                                          (float *)weights->ptr,
                                                          (float *)probs->ptr,
                                                          bias,
@@ -10239,7 +10250,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                                          hash_rows,
                                                          n_tokens,
                                                          has_bias && !hash_mode,
-                                                         hash_mode);
+                                                         hash_mode, n_expert, n_expert_used, expert_weight_scale);
     } else {
         router_select_kernel<<<n_tokens, 1, 0, ds4_decode_stream()>>>((int32_t *)selected->ptr,
                                               (float *)weights->ptr,
@@ -10252,7 +10263,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(ds4_gpu_tensor *selected, ds4_
                                               hash_rows,
                                               n_tokens,
                                               has_bias && !hash_mode,
-                                              hash_mode);
+                                              hash_mode, n_expert, n_expert_used, expert_weight_scale);
     }
     return cuda_ok(cudaGetLastError(), "router_select launch");
 }
@@ -10994,15 +11005,16 @@ __global__ static void moe_count_sorted_pairs_kernel(
 __global__ static void moe_prefix_sorted_pairs_kernel(
         uint32_t *offsets,
         uint32_t *cursors,
-        const uint32_t *counts) {
+        const uint32_t *counts,
+        uint32_t n_expert) {
     if (threadIdx.x == 0) {
         uint32_t sum = 0;
-        for (uint32_t e = 0; e < 256u; e++) {
+        for (uint32_t e = 0; e < n_expert; e++) {
             offsets[e] = sum;
             cursors[e] = sum;
             sum += counts[e];
         }
-        offsets[256] = sum;
+        offsets[n_expert] = sum;
     }
 }
 
@@ -11023,14 +11035,15 @@ __global__ static void moe_build_expert_tile_offsets_kernel(
         uint32_t *tile_offsets,
         uint32_t *tile_total,
         const uint32_t *counts,
-        uint32_t block_m) {
+        uint32_t block_m,
+        uint32_t n_expert) {
     if (threadIdx.x == 0) {
         uint32_t sum = 0;
-        for (uint32_t e = 0; e < 256u; e++) {
+        for (uint32_t e = 0; e < n_expert; e++) {
             tile_offsets[e] = sum;
             sum += (counts[e] + block_m - 1u) / block_m;
         }
-        tile_offsets[256] = sum;
+        tile_offsets[n_expert] = sum;
         *tile_total = sum;
     }
 }
@@ -11040,9 +11053,10 @@ __global__ static void moe_build_expert_tiles_kernel(
         uint32_t *tile_starts,
         const uint32_t *tile_offsets,
         const uint32_t *counts,
-        uint32_t block_m) {
+        uint32_t block_m,
+        uint32_t n_expert) {
     uint32_t e = threadIdx.x;
-    if (e >= 256u) return;
+    if (e >= n_expert) return;
     uint32_t ntiles = (counts[e] + block_m - 1u) / block_m;
     uint32_t off = tile_offsets[e];
     for (uint32_t t = 0; t < ntiles; t++) {
@@ -11285,15 +11299,22 @@ __global__ static void moe_gate_up_mid_expert_tile8_row32_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
+    /* LUT must be loaded into shared mem UNCONDITIONALLY: the shared sxq copy is
+     * only valid when xq_blocks<=16 (sxq is [8][16]), but s_iq2_grid/s_iq2_signs
+     * are consumed by dev_dot_..._deq_lut regardless of xq_blocks. Loading them
+     * inside the <=16 guard left them uninitialized for wide-embd models (Pro:
+     * xq_blocks=28) -> garbage dequant. Flash (xq_blocks=16) is unchanged. */
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
+    }
+    __syncthreads();
+    if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     if (row >= expert_mid_dim) return;
@@ -11375,15 +11396,22 @@ __global__ static void moe_gate_up_mid_expert_tile8_row2048_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
+    /* LUT must be loaded into shared mem UNCONDITIONALLY: the shared sxq copy is
+     * only valid when xq_blocks<=16 (sxq is [8][16]), but s_iq2_grid/s_iq2_signs
+     * are consumed by dev_dot_..._deq_lut regardless of xq_blocks. Loading them
+     * inside the <=16 guard left them uninitialized for wide-embd models (Pro:
+     * xq_blocks=28) -> garbage dequant. Flash (xq_blocks=16) is unchanged. */
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
+    }
+    __syncthreads();
+    if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     for (uint32_t rr = 0; rr < 64u; rr++) {
@@ -11469,15 +11497,22 @@ __global__ static void moe_gate_up_mid_expert_tile8_rowspan_kernel(
         slot[np] = pair[np] - tok[np] * n_expert;
         xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
     }
+    /* LUT must be loaded into shared mem UNCONDITIONALLY: the shared sxq copy is
+     * only valid when xq_blocks<=16 (sxq is [8][16]), but s_iq2_grid/s_iq2_signs
+     * are consumed by dev_dot_..._deq_lut regardless of xq_blocks. Loading them
+     * inside the <=16 guard left them uninitialized for wide-embd models (Pro:
+     * xq_blocks=28) -> garbage dequant. Flash (xq_blocks=16) is unchanged. */
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
+    for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
     if (xq_blocks <= 16u) {
         for (uint32_t i = threadIdx.x; i < np * xq_blocks; i += blockDim.x) {
             uint32_t p = i / xq_blocks;
             uint32_t b = i - p * xq_blocks;
             sxq[p][b] = xqb[p][b];
         }
-        for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) s_iq2_grid[i] = cuda_iq2xxs_grid[i];
-        for (uint32_t i = threadIdx.x; i < 128u; i += blockDim.x) s_iq2_signs[i] = cuda_ksigns_iq2xs[i];
-        __syncthreads();
+    }
+    __syncthreads();
+    if (xq_blocks <= 16u) {
         for (uint32_t p = 0; p < np; p++) xqb[p] = sxq[p];
     }
     for (uint32_t rr = 0; rr < ROW_SPAN / 32u; rr++) {
@@ -12829,17 +12864,17 @@ static int routed_moe_launch(
         ok = cuda_ok(cudaGetLastError(), "routed_moe x quantize launch");
         if (prof_ev[1]) (void)cudaEventRecord(prof_ev[1], 0);
         if (ok && use_sorted_pairs) {
-            const uint64_t counts_bytes = 256ull * sizeof(uint32_t);
-            const uint64_t offsets_bytes = 257ull * sizeof(uint32_t);
-            const uint64_t cursors_bytes = 256ull * sizeof(uint32_t);
+            const uint64_t counts_bytes = (uint64_t)n_total_expert * sizeof(uint32_t);
+            const uint64_t offsets_bytes = ((uint64_t)n_total_expert + 1ull) * sizeof(uint32_t);
+            const uint64_t cursors_bytes = (uint64_t)n_total_expert * sizeof(uint32_t);
             const uint64_t sorted_bytes = (uint64_t)pair_count * sizeof(uint32_t);
             tile_capacity = (pair_count + expert_tile_m - 1u) / expert_tile_m + 256u;
             tile16_capacity = use_down_tile16 ? ((pair_count + 15u) / 16u + 256u) : 0u;
-            const uint64_t tile_offsets_bytes = 257ull * sizeof(uint32_t);
+            const uint64_t tile_offsets_bytes = ((uint64_t)n_total_expert + 1ull) * sizeof(uint32_t);
             const uint64_t tile_total_bytes = sizeof(uint32_t);
             const uint64_t tile_experts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
             const uint64_t tile_starts_bytes = (uint64_t)tile_capacity * sizeof(uint32_t);
-            const uint64_t tile16_offsets_bytes = use_down_tile16 ? 257ull * sizeof(uint32_t) : 0u;
+            const uint64_t tile16_offsets_bytes = use_down_tile16 ? ((uint64_t)n_total_expert + 1ull) * sizeof(uint32_t) : 0u;
             const uint64_t tile16_total_bytes = use_down_tile16 ? sizeof(uint32_t) : 0u;
             const uint64_t tile16_experts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
             const uint64_t tile16_starts_bytes = (uint64_t)tile16_capacity * sizeof(uint32_t);
@@ -12880,7 +12915,7 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted count launch");
                 }
                 if (ok) {
-                    moe_prefix_sorted_pairs_kernel<<<1, 1, 0, ds4_decode_stream()>>>(offsets, cursors, counts);
+                    moe_prefix_sorted_pairs_kernel<<<1, 1, 0, ds4_decode_stream()>>>(offsets, cursors, counts, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted prefix launch");
                 }
                 if (ok) {
@@ -12892,19 +12927,19 @@ static int routed_moe_launch(
                     ok = cuda_ok(cudaGetLastError(), "routed_moe sorted scatter launch");
                 }
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1, 0, ds4_decode_stream()>>>(tile_offsets, tile_total, counts, expert_tile_m);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1, 0, ds4_decode_stream()>>>(tile_offsets, tile_total, counts, expert_tile_m, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile offsets launch");
                 }
                 if (ok && use_expert_tiles) {
-                    moe_build_expert_tiles_kernel<<<1, 256, 0, ds4_decode_stream()>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m);
+                    moe_build_expert_tiles_kernel<<<1, 384, 0, ds4_decode_stream()>>>(tile_experts, tile_starts, tile_offsets, counts, expert_tile_m, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tiles launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tile_offsets_kernel<<<1, 1, 0, ds4_decode_stream()>>>(tile16_offsets, tile16_total, counts, 16u);
+                    moe_build_expert_tile_offsets_kernel<<<1, 1, 0, ds4_decode_stream()>>>(tile16_offsets, tile16_total, counts, 16u, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 offsets launch");
                 }
                 if (ok && use_expert_tiles && use_down_tile16) {
-                    moe_build_expert_tiles_kernel<<<1, 256, 0, ds4_decode_stream()>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u);
+                    moe_build_expert_tiles_kernel<<<1, 384, 0, ds4_decode_stream()>>>(tile16_experts, tile16_starts, tile16_offsets, counts, 16u, n_total_expert);
                     ok = cuda_ok(cudaGetLastError(), "routed_moe expert tile16 launch");
                 }
             }

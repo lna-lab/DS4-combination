@@ -53,6 +53,8 @@ extern int ds4_gpu_pp_p2p_copy_ordered_async(int dst_gpu, int src_gpu,
 extern int ds4_gpu_pp_event_record(int gpu);
 extern int ds4_gpu_pp_stream_wait_event(int gpu, int event_gpu);
 extern void *ds4_gpu_pp_stream_get(int gpu);
+extern void ds4_gpu_set_n_layer(uint32_t n);
+extern void ds4_gpu_set_n_embd(uint32_t n);
 #endif
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -2929,6 +2931,8 @@ static void ds4_select_shape_from_metadata(
                                    n_indexer_head_dim, n_indexer_top_k, n_hc,
                                    n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_FLASH;
+        ds4_gpu_set_n_layer(DS4_N_LAYER);
+        ds4_gpu_set_n_embd(DS4_N_EMBD);
         return;
     }
     if (ds4_shape_matches_metadata(&DS4_SHAPE_PRO,
@@ -2940,6 +2944,8 @@ static void ds4_select_shape_from_metadata(
                                    n_indexer_head_dim, n_indexer_top_k, n_hc,
                                    n_hc_sinkhorn_iter)) {
         g_ds4_shape = DS4_SHAPE_PRO;
+        ds4_gpu_set_n_layer(DS4_N_LAYER);
+        ds4_gpu_set_n_embd(DS4_N_EMBD);
         return;
     }
 

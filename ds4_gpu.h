@@ -602,6 +602,11 @@ int ds4_gpu_directional_steering_project_tensor(
         uint32_t                rows,
         float                   scale);
 
+/* Model shape setters: ds4.c passes n_layer/n_embd after shape selection so the
+ * .cu (which cannot see the g_ds4_shape macros) sizes PP buffers correctly. */
+void ds4_gpu_set_n_layer(uint32_t n);
+void ds4_gpu_set_n_embd(uint32_t n);
+
 int ds4_gpu_router_select_tensor(
         ds4_gpu_tensor       *selected,
         ds4_gpu_tensor       *weights,
