@@ -1,0 +1,619 @@
+{
+ "patches": [
+  {
+   "component": "streaming-core",
+   "summary": "SPEC step 1 extraction map for porting the CUDA SSD expert-streaming engine from UPSTREAM ds4_cuda.cu into FORK ds4_cuda.cu.\n\nWHAT THE FORK ALREADY HAS (reuse, do NOT re-port):\n- enum DS4_CUDA_STREAM_EXPERT_DEFAULT (=8*64=512) / _MAX (=61*384=23424): FORK ds4_cuda.cu:38-39 (identical to upstream 38-39). Already present.\n- global `static int g_ssd_streaming_mode;`: FORK ds4_cuda.cu:94 (identical to upstream 94). Already declared (currently unused — no reads anywhere in fork). Becomes per-device (see below).\n- Lower-level I/O plumbing ALL present in fork:\n  * g_model_fd / g_model_fd_host_base / g_model_direct_fd / g_model_direct_align / g_model_file_size: FORK 82-86.\n  * cuda_pread_full: FORK 1627.\n  * cuda_model_stage_read (direct-fd + fallback): FORK 1642-1676.\n  * cuda_model_drop_file_pages: FORK 1558-1561.\n  * cuda_model_copy_chunk_bytes: FORK 1526.\n  * cuda_model_discard_source_pages: FORK 1539.\n  * cuda_align_ptr: FORK 1579.\n  * g_model_stage[4]/g_model_stage_raw[4]/g_model_stage_event[4]/g_model_stage_bytes: FORK 581-584.\n  * ds4_gpu_set_model_fd: FORK 3085 (already opens g_model_direct_fd, honors DS4_CUDA_NO_DIRECT_IO at 3101).\n  * g_moe_compact_*[DS4_CUDA_MAX_DEVICES] per-device buffers: FORK 630-635 (the mirroring template).\n  * DS4_CUDA_MAX_DEVICES=16: FORK 95.\n\nWHAT IS MISSING AND MUST BE PORTED (entire expert-cache layer + selected-cache + one I/O helper):\nALL of the following symbols return 0 hits in the fork: cuda_stream_expert_cache_slot, cuda_stream_expert_cache, cuda_stream_selected_cache, g_stream_expert_cache, g_stream_selected_cache, the g_stream_expert_* / g_stream_selected_stage* globals, cuda_model_copy_to_device_streamed, ds4_gpu_set_ssd_streaming, all ds4_gpu_stream_* API. No streaming decls in ds4_gpu.h; no ssd_streaming wiring in ds4.c.\n\nEXACT UPSTREAM SOURCE RANGES (orchestrator copies verbatim, then applies per-device transform + Metal guards):\n\nA) Structs — UPSTREAM 132-185:\n   cuda_stream_selected_cache  132-154\n   cuda_stream_expert_cache_slot 156-169\n   cuda_stream_expert_cache    171-185\n\nB) Globals — UPSTREAM 194-200 + 218-222:\n   g_stream_selected_cache 194; g_stream_expert_cache 195;\n   g_stream_expert_budget_override 196; g_stream_expert_runtime_cap 197;\n   g_stream_expert_memory_cap_notice 198; g_stream_expert_runtime_gate_bytes 199;\n   g_stream_expert_runtime_down_bytes 200;\n   g_stream_selected_stage_raw[4] 218; g_stream_selected_stage[4] 219;\n   g_stream_selected_stage_event[4] 220; g_stream_selected_stage_bytes 221;\n   g_stream_selected_upload_stream 222.\n   (g_ssd_streaming_mode 94 already in fork.)\n\nC) Forward decl of cuda_model_copy_to_device_streamed — UPSTREAM 231-237 (fork has none; add near fork's existing static prototypes ~224-240).\n\nD) Static helpers — UPSTREAM 1411-2150 (one contiguous band, copy as a block; line-by-line index):\n   _invalidate 1411; _release 1415; expert_cache_release_all 1431; expert_cache_invalidate 1445;\n   _requested_budget 1454; _configured_budget 1474; _budget_visible_to_shared 1482; _reserve_bytes 1494;\n   _live_budget 1510; _expert_bytes 1581; _note_size 1592; _shrunken_cap 1605; _note_oom_cap 1611;\n   _try_alloc 1648; stage_release 1692; stage_pool_alloc 1711; ensure_bytes 1763; ensure_i32 1791;\n   _prepare 1820; _find 1935; _lru_slot 1967; _copy_to_compact 1983; _load_slot 2011; _seed_one 2068;\n   layer_expert_ranges_valid 2116-2150.\n   NOTE: cuda_stream_selected_stage_release (1692-~1710) and cuda_stream_selected_stage_pool_alloc (1711-1761) and ensure_bytes/ensure_i32 (1763-1818) are NOT in the fork — they belong to this layer and must be ported too (they are not the same as the fork's g_model_stage pool).\n\nE) cuda_model_copy_to_device_streamed (the only missing I/O helper, sits on the fork's existing stage_read/drop_file_pages/discard_source_pages): UPSTREAM 2152-2247.\n\nF) Public extern \\\"C\\\" API (SPEC step 2, but the orchestrator should know its location): UPSTREAM 2757-3340; key entry begin_compact_load 2875-~3100. (Not all of step-1, but ds4_gpu_set_ssd_streaming 2757-2767 and the budget/release setters 2769-2801 are the surface that flips g_ssd_streaming_mode and must be device-iterating in our port.)\n\nThe streaming logic is sm_120-clean (no DS4_CUDA_SPARK_HBM_CACHE / sm_121 guards in the band). It is a ~740-line verbatim graft (1411-2150) + 7 structs/globals blocks + one I/O helper (2152-2247), then the per-device transform below.",
+   "per_device_adaptation": "CRITICAL multi-GPU transform (SPEC risk #1). Upstream's streaming state is SINGLE-DEVICE. Our PP/TP runs up to 7 GPUs and `routed_moe_launch` derives the device via `int compact_dev=0; cudaGetDevice(&compact_dev); if(compact_dev<0||compact_dev>=DS4_CUDA_MAX_DEVICES) compact_dev=0;` (FORK 12627-12629). Mirror g_moe_compact_*[DS4_CUDA_MAX_DEVICES] (FORK 630-635) exactly.\n\nCONVERT TO PER-DEVICE ARRAYS (index by compact_dev = current cudaGetDevice):\n1. `static cuda_stream_selected_cache g_stream_selected_cache;` -> `[DS4_CUDA_MAX_DEVICES]`.\n2. `static cuda_stream_expert_cache g_stream_expert_cache;` -> `[DS4_CUDA_MAX_DEVICES]` (note: contains std::vector<slot>; array-of-struct is fine, default-constructed per element).\n3. g_stream_expert_budget_override / _runtime_cap / _memory_cap_notice / _runtime_gate_bytes / _runtime_down_bytes (196-200): budget_override is a USER SETTING (set once via CLI for all GPUs) — KEEP SCALAR, but the runtime_cap/runtime_gate_bytes/runtime_down_bytes/memory_cap_notice are PER-DEVICE OOM/sizing state -> make those four `[DS4_CUDA_MAX_DEVICES]`. (Each 16GB GPU may shrink its cap independently after OOM.)\n4. Staging pool g_stream_selected_stage_raw/_stage/_stage_event/_stage_bytes/_upload_stream (218-222): pinned host staging + a CUDA stream are bound to the active device's context -> make all five `[DS4_CUDA_MAX_DEVICES]`. (Matches how g_pp_stream/g_tp_stream are per-device in fork: 105,608.)\n5. g_ssd_streaming_mode (94): this is a global ON/OFF mode flag, identical across GPUs -> KEEP SCALAR. Do NOT array-ify (it gates behavior, not resources).\n\nMECHANICAL RULE for the helper band (1411-2150): every bare reference `g_stream_expert_cache.X` / `g_stream_selected_cache.X` / the five staging globals / the four runtime globals becomes `[dev]`-indexed where `dev` is a new parameter threaded through, OR computed at the top of each helper via `int dev=0; cudaGetDevice(&dev); if(dev<0||dev>=DS4_CUDA_MAX_DEVICES) dev=0;`. Recommended: thread an explicit `int dev` parameter into the leaf helpers (_prepare, _find, _lru_slot, _copy_to_compact, _load_slot, _seed_one, release_all, invalidate, _try_alloc on the staging side, ensure_bytes/_i32, stage_pool_alloc, copy_to_device_streamed) and pass compact_dev from the call site, rather than calling cudaGetDevice inside hot leaf functions (avoids per-expert driver query in the decode loop). The selected-cache validity probe (upstream 12262-12289 region, which in the fork is the new streaming branch) must compare against g_stream_selected_cache[compact_dev].\n\nTEARDOWN: the fork already loops `for(int cd=0; cd<DS4_CUDA_MAX_DEVICES; cd++)` freeing g_moe_compact_* (FORK 2784-2790). Add the per-device cuda_stream_selected_cache_release(cd)/cuda_stream_expert_cache_release_all(cd)/cuda_stream_selected_stage_release(cd) into that same loop. ds4_gpu_set_ssd_streaming and the budget setters (upstream 2757-2777) must iterate all devices (cudaSetDevice(cd) before freeing, since cudaFree is context-bound) when tearing caches down — upstream's single-shot release is a multi-GPU correctness bug for us.\n\nSEED/BUDGET: ds4.c wiring (SPEC step 5) that calls seed_experts / set_streaming_expert_cache_budget must loop devices (cudaSetDevice each) so every PP stage gets its hotlist-seeded resident cache. Upstream never ran multi-GPU streaming, so this loop does not exist upstream.",
+   "graph_capture_handling": "SPEC risk #2 — the streaming begin_compact_load does a host-side D2H read of selected ids + host LRU bookkeeping + sync, which is ILLEGAL inside an active CUDA graph capture. The fork already has the exact guard pattern to reuse: in routed_moe_launch the compact block detects capture via `int capture_active=0; if(g_cuda_decode_stream_created){cudaStreamCaptureStatus st; if(cudaSuccess==cudaStreamIsCapturing(ds4_decode_stream(),&st)) capture_active=(st==cudaStreamCaptureStatusActive);}` (FORK 12680-12685) and takes a capture-safe fast path at 12686-12690 (uses the pre-seeded g_moe_compact_* buffers, no host read).\n\nFor the streaming port, the new streaming branch (inserted before the existing else at FORK 12691) MUST be gated `if(!capture_active)`. When capture IS active, fall through to the existing capture-safe compact buffers (12686-12690) — i.e. streaming pre-seeds the resident cache + compact buffer OUTSIDE capture (via ds4_gpu_stream_expert_cache_prepare_selected_batch / seed at decode-prep time), then capture replays the kernels against already-populated g_stream_selected_cache[dev].{gate,up,down}_ptr. Also note the fork already advertises this constraint: ds4_gpu_decode_graph_can_capture (FORK 443-456) prints \\\"graph capture disabled: MoE weights are streamed\\\" — so the simplest correct integration is to let streamed layers DISABLE decode-graph capture (return 0 from can_capture when g_ssd_streaming_mode), which sidesteps the host-read-in-capture hazard entirely at the cost of per-kernel launch overhead on streamed layers. Recommend wiring g_ssd_streaming_mode into ds4_gpu_decode_graph_can_capture as the conservative first cut; optimize to pre-seed-then-capture later.",
+   "metal_stub_draft": "// In ds4_metal.m — only needed for the NEW ds4_gpu_* symbols that ds4.c (shared) will call.\n// The internal cuda_stream_* helpers are static in ds4_cuda.cu and are NEVER referenced from ds4.c,\n// so they need NO Metal stub and NO #ifndef guard (they don't exist in the Metal TU at all).\n// ONLY the extern \"C\" public API that ds4.c calls crosses the boundary. For streaming-core (step 1)\n// the only such symbol introduced is ds4_gpu_set_ssd_streaming + (in step 2) the ds4_gpu_stream_* set.\n// Provide Metal no-op stubs so the Metal build links (CUDA build never compiles ds4_metal.o):\n\nvoid ds4_gpu_set_ssd_streaming(bool enabled) { (void)enabled; }\n// (step-2 surface, stub now to avoid a second breakage:)\nvoid ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) { (void)experts; }\nuint32_t ds4_gpu_stream_expert_cache_configured_count(void) { return 0; }\nuint32_t ds4_gpu_stream_expert_cache_current_count(void) { return 0; }\nvoid ds4_gpu_stream_expert_cache_release_resident(void) { }\n// ds4_gpu_stream_expert_cache_prepare_selected_batch returns 1 (=fall back to non-streaming gather):\nint ds4_gpu_stream_expert_cache_prepare_selected_batch(const ds4_gpu_stream_expert_table *t,\n        const int32_t *sel, uint32_t n_tokens, uint32_t n_expert) {\n    (void)t; (void)sel; (void)n_tokens; (void)n_expert; return 1;\n}\n// Alternatively (preferred per METAL-SAFETY RULE) guard each call site in ds4.c with\n//   #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))\n// as the SPEC step 3 prescribes for _prepare_selected_batch. Pick ONE per symbol; do not leave a\n// ds4.c call to a NEW ds4_gpu_* with neither a stub nor a guard (silent Metal-build break).",
+   "upstream_sources": [
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "132-185",
+     "symbols": "struct cuda_stream_selected_cache (132-154), cuda_stream_expert_cache_slot (156-169), cuda_stream_expert_cache (171-185)",
+     "purpose": "the three cache structs; copy verbatim into fork after its cuda_q8_f32_range struct (fork ~131). expert_cache holds std::vector<slot>."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "194-200",
+     "symbols": "g_stream_selected_cache, g_stream_expert_cache, g_stream_expert_budget_override, g_stream_expert_runtime_cap, g_stream_expert_memory_cap_notice, g_stream_expert_runtime_gate_bytes, g_stream_expert_runtime_down_bytes",
+     "purpose": "engine globals. Per-device transform: caches + runtime_cap/gate/down/memory_notice -> [DS4_CUDA_MAX_DEVICES]; budget_override stays scalar. g_ssd_streaming_mode already in fork at 94 (scalar, keep)."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "218-222",
+     "symbols": "g_stream_selected_stage_raw[4], g_stream_selected_stage[4], g_stream_selected_stage_event[4], g_stream_selected_stage_bytes, g_stream_selected_upload_stream",
+     "purpose": "pinned H2D staging quad-buffer + upload stream for streamed copies. ALL -> [DS4_CUDA_MAX_DEVICES] (context-bound, like g_pp_stream). Distinct from fork's existing g_model_stage* (581-584)."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "231-237",
+     "symbols": "forward decl of cuda_model_copy_to_device_streamed",
+     "purpose": "static prototype; place with fork's other static fwd decls (~224-240)."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "1411-2150",
+     "symbols": "cuda_stream_selected_cache_invalidate/_release; cuda_stream_expert_cache_release_all/_invalidate/_requested_budget/_configured_budget/_budget_visible_to_shared/_reserve_bytes/_live_budget/_expert_bytes/_note_size/_shrunken_cap/_note_oom_cap/_try_alloc; cuda_stream_selected_stage_release/_stage_pool_alloc/_ensure_bytes/_ensure_i32; cuda_stream_expert_cache_prepare/_find/_lru_slot/_copy_to_compact/_load_slot/_seed_one; cuda_stream_layer_expert_ranges_valid",
+     "purpose": "the entire static helper band — one contiguous verbatim graft. Thread int dev param (or compute via cudaGetDevice at top) and index the per-device globals. ~740 lines."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "2152-2247",
+     "symbols": "cuda_model_copy_to_device_streamed",
+     "purpose": "the ONLY missing I/O helper. Sits on fork's existing cuda_model_stage_read (1642), cuda_model_drop_file_pages (1558), cuda_model_discard_source_pages (1539), cuda_model_copy_chunk_bytes (1526). Uses per-device g_stream_selected_stage*/_upload_stream + cuda_stream_selected_stage_pool_alloc — index by dev."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "2757-2801",
+     "symbols": "ds4_gpu_set_ssd_streaming (2757), ds4_gpu_set_streaming_expert_cache_budget (2769), ds4_gpu_set_streaming_expert_cache_expert_bytes (2779 no-op), ds4_gpu_recommended_working_set_size (2783 no-op), ds4_gpu_stream_expert_cache_configured_count (2787), _current_count (2792), _reset_route_hotness (2796 no-op), _release_resident (2799)",
+     "purpose": "step-1-adjacent public surface that flips g_ssd_streaming_mode and tears caches. MUST iterate all devices (cudaSetDevice(cd) before cudaFree) for our multi-GPU teardown. The deeper public API (begin_compact_load 2875-~3100 etc.) is SPEC step 2."
+    }
+   ],
+   "new_gpu_apis_called_from_shared_ds4c": [
+    "ds4_gpu_set_ssd_streaming (called from ds4.c engine init, SPEC step 5) — needs Metal stub or #ifndef __APPLE__ guard",
+    "ds4_gpu_set_streaming_expert_cache_budget (step 5 budget wiring) — Metal stub/guard",
+    "ds4_gpu_stream_expert_cache_configured_count (working-set/log) — Metal stub/guard",
+    "ds4_gpu_stream_expert_cache_current_count (log) — Metal stub/guard",
+    "ds4_gpu_stream_expert_cache_release_resident — Metal stub/guard",
+    "ds4_gpu_stream_expert_cache_budget_for_expert_size — Metal stub/guard",
+    "ds4_gpu_stream_expert_cache_prepare_selected_batch (decode hook, SPEC explicitly says wrap in #if defined(DS4_ROCM_BUILD)||(!defined(DS4_NO_GPU)&&!defined(__APPLE__))) — guard at call site",
+    "ds4_gpu_stream_expert_cache_seed_experts / seed_selected (startup hotlist seed) — Metal stub/guard"
+   ],
+   "risks": [
+    "Per-device array-ify is the load-bearing change: g_stream_expert_cache/g_stream_selected_cache + the 5 staging globals + 4 runtime-sizing globals MUST become [DS4_CUDA_MAX_DEVICES] indexed by compact_dev (cudaGetDevice). Leaving any single-device causes PP-stage thrash/corruption (SPEC risk #1). g_ssd_streaming_mode and budget_override stay scalar.",
+    "g_stream_expert_cache contains a std::vector<cuda_stream_expert_cache_slot>; an array-of-16 default-constructs 16 vectors — fine, but cuda_stream_expert_cache_release_all/_invalidate must operate on [dev] not a global, and the memset(&cache,0,...) trick upstream uses (1428,1442) would CLOBBER the vector for the device entry — replace memset with explicit field reset for the expert_cache struct (selected_cache memset is OK, no vector).",
+    "cudaFree/cudaFreeHost/cudaStreamDestroy are context-bound: teardown and ds4_gpu_set_ssd_streaming(false) must cudaSetDevice(cd) before freeing each device's caches. Upstream's single-shot release (2764-2766) is a multi-GPU leak/UB for us.",
+    "CUDA-graph capture hazard (SPEC risk #2): begin_compact_load does host D2H + LRU bookkeeping illegal under active capture. Gate the new streaming branch in routed_moe_launch with the existing capture_active probe (FORK 12680-12685) and/or make ds4_gpu_decode_graph_can_capture (FORK 443) return 0 when g_ssd_streaming_mode.",
+    "METAL-SAFETY: every NEW extern \"C\" ds4_gpu_* listed above is reachable from shared ds4.c. Each needs a Metal stub in ds4_metal.m OR an #ifndef __APPLE__ guard at the ds4.c call site, else the Metal build breaks silently (CUDA build never compiles ds4_metal.o).",
+    "O_DIRECT vs page-cache (SPEC risk #3): cuda_model_copy_to_device_streamed reads via cuda_model_stage_read which prefers g_model_direct_fd (O_DIRECT, bypasses page cache). For the 1024GB-resident strategy DS4_CUDA_NO_DIRECT_IO=1 + DS4_CUDA_KEEP_MODEL_PAGES=1 MUST be set together; ds4_gpu_set_model_fd (FORK 3101) already honors NO_DIRECT_IO. Verify the streamed-copy path actually falls back to g_model_fd (buffered) when direct fd is closed.",
+    "g_ssd_streaming_mode is currently declared-but-unread in the fork (only the declaration at 94 exists). Porting the engine introduces the first readers; confirm no name clash and that ds4.c never expected it to mean something else.",
+    "The staging-pool/ensure helpers (upstream 1692-1818) are NOT the fork's g_model_stage pool — they are a separate selected-stream pool. Do not accidentally alias them onto the fork's existing g_model_stage[4]; port them as distinct per-device globals.",
+    "Per-expert cudaGetDevice() inside leaf helpers (_load_slot/_seed_one) called in the decode hot loop would add driver-query latency; thread an explicit int dev parameter from routed_moe_launch's compact_dev (FORK 12627) instead of querying per call."
+   ],
+   "fork_edits": []
+  },
+  {
+   "component": "public-api",
+   "summary": "Extracted the full extern \"C\" public streaming API from UPSTREAM ds4_cuda.cu and the matching ds4_gpu.h declaration block + struct. \n\nUPSTREAM CUDA source (ds4_cuda.cu), exact current line ranges (HEAD-of-upstream as read today):\n- ds4_gpu_set_model_fd_for_map: 2668-2702 (O_DIRECT body; param `(int fd, const void *model_map)`; sets g_model_fd, g_model_fd_host_base=model_map, g_model_file_size, g_model_direct_fd via /proc/self/fd O_DIRECT gated by DS4_CUDA_NO_DIRECT_IO).\n- ds4_gpu_set_model_fd (upstream thin wrapper): 2704-2706 -> calls _for_map(fd, g_model_host_base).\n- ds4_gpu_set_ssd_streaming: 2757-2767\n- ds4_gpu_set_streaming_expert_cache_budget: 2769-2777\n- ds4_gpu_set_streaming_expert_cache_expert_bytes (no-op): 2779-2781\n- ds4_gpu_recommended_working_set_size (returns 0): 2783-2785\n- ds4_gpu_stream_expert_cache_configured_count: 2787-2790\n- ds4_gpu_stream_expert_cache_current_count: 2792-2794\n- ds4_gpu_stream_expert_cache_reset_route_hotness (empty): 2796-2797\n- ds4_gpu_stream_expert_cache_release_resident: 2799-2801\n- ds4_gpu_stream_expert_cache_budget_for_expert_size: 2803-2813\n- ds4_gpu_stream_expert_cache_seed_selected: 2815-2873\n- cuda_stream_selected_cache_begin_compact_load (static, the dedup+LRU+SSD-fallback+D2D core): 2875-3115\n- ds4_gpu_stream_expert_cache_begin_selected_load: 3117-3174\n- ds4_gpu_stream_expert_cache_prepare_selected_batch (the decode hook): 3176-3244\n- ds4_gpu_stream_expert_cache_seed_experts: 3246-3345\n\nUPSTREAM ds4_gpu.h declarations:\n- _for_map prototype: line 59 (ADD to fork)\n- ds4_gpu_set_ssd_streaming / _set_streaming_expert_cache_budget / _expert_bytes / recommended_working_set / configured_count / current_count: 74-79\n- ds4_gpu_stream_expert_table struct: lines 80-90 (9 fields: const void* model_map; uint64_t model_size; uint32_t layer; uint32_t n_total_expert; uint64_t gate_offset, up_offset, down_offset, gate_expert_bytes, down_expert_bytes)\n- reset_route_hotness/release_resident/budget_for_expert_size/seed_selected/begin_selected_load: 91-105\n- prepare_selected_batch ALREADY wrapped in the Metal-safe guard `#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))`: 106-112\n- ROCm-only load_layer/seed_from_layer_selected/release_layer_cache: 113-123 (do NOT port; ROCm-gated)\n- seed_experts: 124-128\n\nRECONCILIATION of ds4_gpu_set_model_fd_for_map with FORK: The SPEC's claim of a fork `_for_map` at ~2730 is INCORRECT. The fork has NO `_for_map`. The fork's existing `ds4_gpu_set_model_fd(int fd)` at ds4_cuda.cu:3085-3119 ALREADY contains the upstream O_DIRECT body verbatim (sets g_model_fd, g_model_fd_host_base=g_model_host_base, g_model_file_size, g_model_direct_fd via /proc O_DIRECT, gated by DS4_CUDA_NO_DIRECT_IO). The fork already declares all the needed globals (g_model_fd_host_base @84, g_model_direct_fd @85, g_model_direct_align @86, g_model_file_size @87). So adopting upstream is trivial: ADD a 2-arg `_for_map` overload that takes an explicit model_map (so ds4.c can pass e->model.map / e->mtp_model.map at 25937/25954/25963) and make the existing 1-arg set_model_fd delegate to it with g_model_host_base. Keep ALL fork globals; the O_DIRECT body is identical so nothing else changes.\n\nPER-DEVICE NOTE for the orchestrator: g_model_fd/g_model_fd_host_base/g_model_direct_* are currently single-global in BOTH repos and are touched by set_model_fd which ds4.c calls once. These are about the (single) GGUF file fd, not per-GPU state, so they can stay global. The per-device arrayization risk applies to g_stream_expert_cache / g_stream_selected_cache / g_ssd_streaming_mode (handled by the engine/launch components, not this public-api component) — but note that several of these public APIs READ those globals (configured_count reads cache budget; current_count reads g_stream_expert_cache.count; set_ssd_streaming writes g_ssd_streaming_mode), so once those globals become per-device arrays, EVERY function body in this block must select the current device's slot (e.g. via cudaGetDevice) or be called once-per-device by the caller.",
+   "upstream_sources": [
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "2668-2706",
+     "symbols": "ds4_gpu_set_model_fd_for_map (O_DIRECT body) + ds4_gpu_set_model_fd thin wrapper",
+     "purpose": "fd/O_DIRECT plumbing; adopt the 2-arg _for_map body, reconcile with fork's existing 1-arg set_model_fd@3085"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "2757-2813",
+     "symbols": "ds4_gpu_set_ssd_streaming, _set_streaming_expert_cache_budget, _set_streaming_expert_cache_expert_bytes, ds4_gpu_recommended_working_set_size, _configured_count, _current_count, _reset_route_hotness, _release_resident, _budget_for_expert_size",
+     "purpose": "small extern C config/query API; verbatim copy"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "2815-2873",
+     "symbols": "ds4_gpu_stream_expert_cache_seed_selected",
+     "purpose": "verbatim copy (extern C); reads g_ssd_streaming_mode + global expert cache"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "2875-3115",
+     "symbols": "cuda_stream_selected_cache_begin_compact_load (static core: dedup+LRU probe+SSD fallback+D2D compact)",
+     "purpose": "verbatim copy; the gather core that replaces fork compact gather in streaming mode; reads g_stream_selected_cache + g_stream_expert_cache + g_ssd_streaming_mode globals"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "3117-3174",
+     "symbols": "ds4_gpu_stream_expert_cache_begin_selected_load",
+     "purpose": "verbatim copy (extern C); builds compact_ids/slot_ids then calls begin_compact_load"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "3176-3244",
+     "symbols": "ds4_gpu_stream_expert_cache_prepare_selected_batch (decode hook)",
+     "purpose": "verbatim copy (extern C); batched n_tokens*n_selected variant; called from shared ds4.c -> needs Metal stub or guard"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "3246-3345",
+     "symbols": "ds4_gpu_stream_expert_cache_seed_experts",
+     "purpose": "verbatim copy (extern C); hotlist priority-sorted seeding"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_gpu.h",
+     "region": "59",
+     "symbols": "int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);",
+     "purpose": "ADD this prototype to fork ds4_gpu.h after the existing line 44 set_model_fd"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_gpu.h",
+     "region": "74-128",
+     "symbols": "stream API prototypes + ds4_gpu_stream_expert_table struct (80-90); prepare_selected_batch already wrapped in #if defined(DS4_ROCM_BUILD)||(!defined(DS4_NO_GPU)&&!defined(__APPLE__)) at 106-112; ROCm-only load_layer/seed_from_layer_selected/release_layer_cache 113-123 (skip)",
+     "purpose": "header decl block to graft into fork ds4_gpu.h; fork currently has NONE of these (struct or stream prototypes)"
+    }
+   ],
+   "fork_edits": [
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_cuda.cu",
+     "anchor": "extern \"C\" int ds4_gpu_set_model_fd(int fd) {\n    g_model_fd = fd;\n    g_model_fd_host_base = g_model_host_base;\n    g_model_file_size = 0;",
+     "action": "replace",
+     "content": "RECONCILE ds4_gpu_set_model_fd_for_map: Replace the fork's 1-arg ds4_gpu_set_model_fd body (currently at ds4_cuda.cu:3085-3119) with a 2-arg _for_map that takes an explicit model_map, plus a thin 1-arg wrapper. Keep ALL fork globals (g_model_fd, g_model_fd_host_base, g_model_file_size, g_model_direct_fd, g_model_direct_align) unchanged — the O_DIRECT body is already identical to upstream. Exact replacement:\n\nextern \"C\" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {\n    g_model_fd = fd;\n    g_model_fd_host_base = model_map;\n    g_model_file_size = 0;\n    if (g_model_direct_fd >= 0) {\n        (void)close(g_model_direct_fd);\n        g_model_direct_fd = -1;\n    }\n    g_model_direct_align = 1;\n    if (fd >= 0) {\n        struct stat st;\n        if (fstat(fd, &st) == 0 && st.st_size > 0) {\n            g_model_file_size = (uint64_t)st.st_size;\n            if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;\n        }\n#if defined(__linux__) && defined(O_DIRECT)\n        if (getenv(\"DS4_CUDA_NO_DIRECT_IO\") == NULL) {\n            char proc_path[64];\n            snprintf(proc_path, sizeof(proc_path), \"/proc/self/fd/%d\", fd);\n            int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);\n            if (direct_fd >= 0) {\n                g_model_direct_fd = direct_fd;\n                if (g_model_direct_align < 512) g_model_direct_align = 512;\n                if (getenv(\"DS4_CUDA_WEIGHT_CACHE_VERBOSE\")) {\n                    fprintf(stderr, \"ds4: CUDA model direct I/O enabled (align=%llu)\\n\",\n                            (unsigned long long)g_model_direct_align);\n                }\n            } else if (getenv(\"DS4_CUDA_WEIGHT_CACHE_VERBOSE\")) {\n                fprintf(stderr, \"ds4: CUDA model direct I/O unavailable: %s\\n\", strerror(errno));\n            }\n        }\n#endif\n    }\n    return 1;\n}\n\nextern \"C\" int ds4_gpu_set_model_fd(int fd) {\n    return ds4_gpu_set_model_fd_for_map(fd, g_model_host_base);\n}"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_gpu.h",
+     "anchor": "int ds4_gpu_set_model_fd(int fd);",
+     "action": "insert_after",
+     "content": "int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_gpu.h",
+     "anchor": "void ds4_gpu_set_quality(bool quality);",
+     "action": "insert_after",
+     "content": "Graft UPSTREAM ds4_gpu.h lines 74-112 + 124-128 here (the public stream API). Verbatim:\n\nvoid ds4_gpu_set_ssd_streaming(bool enabled);\nvoid ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);\nvoid ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);\nuint64_t ds4_gpu_recommended_working_set_size(void);\nuint32_t ds4_gpu_stream_expert_cache_configured_count(void);\nuint32_t ds4_gpu_stream_expert_cache_current_count(void);\ntypedef struct ds4_gpu_stream_expert_table {\n    const void *model_map;\n    uint64_t    model_size;\n    uint32_t    layer;\n    uint32_t    n_total_expert;\n    uint64_t    gate_offset;\n    uint64_t    up_offset;\n    uint64_t    down_offset;\n    uint64_t    gate_expert_bytes;\n    uint64_t    down_expert_bytes;\n} ds4_gpu_stream_expert_table;\nvoid ds4_gpu_stream_expert_cache_reset_route_hotness(void);\nvoid ds4_gpu_stream_expert_cache_release_resident(void);\nuint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(\n        uint64_t gate_expert_bytes,\n        uint64_t down_expert_bytes);\nint ds4_gpu_stream_expert_cache_seed_selected(\n        const ds4_gpu_stream_expert_table *table,\n        const int32_t                     *selected_ids,\n        uint32_t                           n_selected);\nint ds4_gpu_stream_expert_cache_begin_selected_load(\n        const ds4_gpu_stream_expert_table *table,\n        const int32_t                     *selected_ids,\n        uint32_t                           n_selected);\n#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))\nint ds4_gpu_stream_expert_cache_prepare_selected_batch(\n        const ds4_gpu_stream_expert_table *table,\n        const int32_t                     *selected_ids,\n        uint32_t                           n_tokens,\n        uint32_t                           n_selected);\n#endif\nint ds4_gpu_stream_expert_cache_seed_experts(\n        const ds4_gpu_stream_expert_table *table,\n        const int32_t                     *expert_ids,\n        const uint32_t                    *expert_priorities,\n        uint32_t                           n_experts);\n\nDO NOT port the ROCm-only block (upstream 113-123: load_layer/seed_from_layer_selected/release_layer_cache) unless the engine component asks — they are #ifdef DS4_ROCM_BUILD."
+    }
+   ],
+   "metal_stub_draft": "FORK Metal currently has ONLY `int ds4_gpu_set_model_fd(int fd){(void)fd;return 1;}` at ds4_metal.m:4912 and NONE of the stream APIs (upstream Metal has a full native streaming engine, but the fork's Metal does not). Of the ported APIs, the ones CALLED FROM shared ds4.c need a Metal stub OR an __APPLE__ guard at the call site. Since the fork's ds4.c streaming wiring is being added fresh by the engine/launch components, the cleanest Metal-safe path is: (A) the header already guards prepare_selected_batch with `#if defined(DS4_ROCM_BUILD)||(!defined(DS4_NO_GPU)&&!defined(__APPLE__))`, so its ds4.c call sites must be inside the same guard (no Metal stub needed for that one); (B) for the always-declared ones that ds4.c will call (set_ssd_streaming, set_streaming_expert_cache_budget, set_streaming_expert_cache_expert_bytes, recommended_working_set_size, configured_count, current_count, reset_route_hotness, release_resident, budget_for_expert_size, seed_selected, begin_selected_load, seed_experts, set_model_fd_for_map) add no-op Metal stubs in ds4_metal.m. Add `int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map){(void)fd;(void)model_map;return 1;}` next to the existing set_model_fd stub. Drafted Metal stub block:\\n\\nvoid ds4_gpu_set_ssd_streaming(bool enabled){(void)enabled;}\\nvoid ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts){(void)experts;}\\nvoid ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes){(void)bytes;}\\nuint64_t ds4_gpu_recommended_working_set_size(void){return 0;}\\nuint32_t ds4_gpu_stream_expert_cache_configured_count(void){return 0;}\\nuint32_t ds4_gpu_stream_expert_cache_current_count(void){return 0;}\\nvoid ds4_gpu_stream_expert_cache_reset_route_hotness(void){}\\nvoid ds4_gpu_stream_expert_cache_release_resident(void){}\\nuint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(uint64_t g,uint64_t d){(void)g;(void)d;return 0;}\\nint ds4_gpu_stream_expert_cache_seed_selected(const ds4_gpu_stream_expert_table *t,const int32_t *s,uint32_t n){(void)t;(void)s;(void)n;return 1;}\\nint ds4_gpu_stream_expert_cache_begin_selected_load(const ds4_gpu_stream_expert_table *t,const int32_t *s,uint32_t n){(void)t;(void)s;(void)n;return 1;}\\nint ds4_gpu_stream_expert_cache_seed_experts(const ds4_gpu_stream_expert_table *t,const int32_t *e,const uint32_t *p,uint32_t n){(void)t;(void)e;(void)p;(void)n;return 1;}\\nint ds4_gpu_set_model_fd_for_map(int fd,const void *model_map){(void)fd;(void)model_map;return 1;}\\n\\nNote: return values matter — configured_count returning 0 makes ds4.c's `if(configured_count()<DS4_N_EXPERT)` path treat streaming as unconfigured on Metal (safe); seed/begin/prepare returning 1 = success-noop matches the upstream CUDA convention of returning 1 when !g_ssd_streaming_mode. prepare_selected_batch needs a Metal stub too IF the engine component does not guard its ds4.c call with __APPLE__; safest to also add `int ds4_gpu_stream_expert_cache_prepare_selected_batch(const ds4_gpu_stream_expert_table *t,const int32_t *s,uint32_t nt,uint32_t ns){(void)t;(void)s;(void)nt;(void)ns;return 1;}` (but only when not already provided by a native Metal engine, which the fork lacks).",
+   "new_gpu_apis_called_from_shared_ds4c": [
+    "ds4_gpu_set_model_fd_for_map (upstream ds4.c calls at 25937/25954/25963 for model + mtp_model maps; fork ds4.c currently only calls 1-arg ds4_gpu_set_model_fd at 19605 — engine component will add the _for_map calls) -> Metal stub needed (no __APPLE__ guard exists)",
+    "ds4_gpu_set_ssd_streaming (ds4.c:25730) -> Metal stub needed",
+    "ds4_gpu_set_streaming_expert_cache_budget (ds4.c:25736) -> Metal stub needed",
+    "ds4_gpu_set_streaming_expert_cache_expert_bytes (ds4.c:25746) -> Metal stub needed",
+    "ds4_gpu_recommended_working_set_size (ds4.c:3399 and 25401) -> Metal stub needed",
+    "ds4_gpu_stream_expert_cache_configured_count (ds4.c:11624, 11719) -> Metal stub needed",
+    "ds4_gpu_stream_expert_cache_current_count (ds4.c:19790) -> Metal stub needed",
+    "ds4_gpu_stream_expert_cache_reset_route_hotness (ds4.c:19594, 20979) -> Metal stub needed",
+    "ds4_gpu_stream_expert_cache_release_resident (ds4.c:20340) -> Metal stub needed",
+    "ds4_gpu_stream_expert_cache_budget_for_expert_size (ds4.c:19780) -> Metal stub needed",
+    "ds4_gpu_stream_expert_cache_seed_selected (ds4.c:19738) -> Metal stub needed",
+    "ds4_gpu_stream_expert_cache_begin_selected_load (ds4.c:14065,14245,14308,14502,15862) -> Metal stub needed",
+    "ds4_gpu_stream_expert_cache_prepare_selected_batch (ds4.c:14389,14681) -> ALREADY header-guarded by #if !defined(__APPLE__); call sites must be inside same guard (then NO Metal stub needed), else add stub",
+    "ds4_gpu_stream_expert_cache_seed_experts (ds4.c:19859) -> Metal stub needed"
+   ],
+   "per_device_adaptation": "This public-api component itself defines no per-device buffers, but its function BODIES read/write the single-device streaming globals (g_ssd_streaming_mode, g_stream_expert_cache, g_stream_selected_cache, g_stream_expert_budget_override, g_stream_expert_runtime_cap/gate_bytes/down_bytes, g_stream_expert_memory_cap_notice) that the statics/engine components are arrayizing to [DS4_CUDA_MAX_DEVICES] to match the fork's existing g_moe_compact_*[] pattern. Therefore, after arrayization, every function in this block (set_ssd_streaming, set_streaming_expert_cache_budget, configured_count, current_count, release_resident, seed_selected, begin_selected_load, prepare_selected_batch, seed_experts, and cuda_stream_selected_cache_begin_compact_load) must resolve the current device via cudaGetDevice() and index the [dev] slot — OR ds4.c must iterate all devices when calling the once-per-process config setters (set_ssd_streaming/set_streaming_expert_cache_budget/expert_bytes), exactly as the SPEC risk #1 demands ('seed/budget も全 device 反復'). The fd globals (g_model_fd, g_model_fd_host_base, g_model_direct_fd, g_model_direct_align, g_model_file_size) are file-scoped (one GGUF) and stay single-global; do NOT arrayize them. Recommendation for the orchestrator: keep the public-api function bodies verbatim but have the launch/engine component wrap the per-device selection (either inside each body via cudaGetDevice, or by the ds4.c caller looping over GPUs); document this seam so the device-context (cudaSetDevice) is correct when these extern C functions run during PP stage execution.",
+   "risks": [
+    "FORK has NO ds4_gpu_set_model_fd_for_map — the SPEC's '~2730 fork _for_map' reference is wrong. The fork's existing 1-arg ds4_gpu_set_model_fd@3085 already carries the upstream O_DIRECT body verbatim, so reconciliation = add a 2-arg _for_map and make set_model_fd delegate. Low risk, but the orchestrator must NOT expect to merge two existing _for_map bodies.",
+    "Single-device globals: every function body here touches g_ssd_streaming_mode / g_stream_*; once those become per-device arrays (other components), these bodies break unless they index by current device. This is the #1 multi-GPU correctness risk for the whole port and lands squarely on this API surface.",
+    "CUDA Graph capture incompatibility: begin_compact_load (2875-3115) does host LRU bookkeeping, H2D copies, and a host->device slot_ids memcpy — it CANNOT run during graph capture. The fork's routed_moe_launch has a capture-active fast path (~12680-12690). prepare_selected_batch/begin_selected_load must be invoked OUTSIDE capture (pre-seed compact buffers before replay) or the streamed layers must skip graph capture. This is a design seam the launch component must resolve; the public API as written assumes eager (non-captured) host orchestration.",
+    "Metal build breakage (METAL-SAFETY): 13 of these 14 APIs are called from shared ds4.c and have NO __APPLE__ guard, and the fork's ds4_metal.m has none of them (only a set_model_fd stub). Without the drafted Metal no-op stubs (or guarding every ds4.c call), the Metal link fails invisibly because CUDA builds never compile ds4_metal.o. prepare_selected_batch is the only one already header-guarded for __APPLE__.",
+    "Return-value semantics must be preserved on Metal stubs: configured_count==0 signals 'streaming unconfigured' to ds4.c gating (`< DS4_N_EXPERT`), and seed/begin/prepare return 1 (success-noop) matching the CUDA `if(!g_ssd_streaming_mode)return 1;` convention. A stub returning 0 from seed/begin would make ds4.c treat streaming setup as a hard failure on Metal.",
+    "cuda_stream_selected_cache_begin_compact_load is `static` (file-local) in upstream and depends on a large set of static helpers (cuda_stream_expert_cache_prepare/find/lru_slot/load_slot/copy_to_compact, cuda_stream_selected_ensure_bytes/i32, cuda_stream_layer_expert_ranges_valid, cuda_model_copy_to_device_streamed, cuda_model_load_progress_finish). Those live in the statics/helpers component (upstream ~132-2240). This public-api block will not compile in isolation — it must be grafted AFTER that helper component, or the orchestrator gets undefined-reference errors."
+   ]
+  },
+  {
+   "component": "routed-moe-reconcile",
+   "summary": "## Design: streaming reconciliation inside the fork's routed_moe_launch (ds4_cuda.cu:12526)\n\n### What the fork does today (the anchor I wrap)\nThe fork's compact path (FORK 12639-12746) already has the exact shape upstream's streaming engine wants: it computes a remap and points `gate_w/up_w/down_w` + `selected_ptr` at a compact buffer. The MoE kernels consume EXACTLY ONE device pointer for routing: `selected_ptr` (FORK 12781-12783) which every kernel reads as `*_w + selected[pair]*expert_bytes`. So the swap is clean iff I redirect all four (gate_w, up_w, down_w, selected_ptr) together and nothing else.\n\nCRITICAL SEMANTIC MATCH I verified: the fork's compact layout is PER-PAIR (slot_off=(ti*n_expert+ei)*expert_bytes; compact_remap[k]=k, FORK 12718-12728). Upstream's `prepare_selected_batch` (UP 3176-3244) instead DEDUPS: it packs only UNIQUE experts into `g_stream_selected_cache.{gate,up,down}_ptr` and writes `slot_ids[pair]=compact_slot_of_unique_expert` into `slot_selected_ptr` (exposed as `slot_selected_tensor`, UP 3091-3095). Both schemes satisfy the kernel contract `weight = base + selected[pair]*expert_bytes` — upstream's is strictly better (shared slot for duplicate experts across tokens). So in streaming mode I set selected_ptr = g_stream_selected_cache[dev].slot_selected_ptr and the three weight bases = the dedup-packed buffers. NO kernel change. This is the whole reconciliation.\n\n### The structural edit (insert a streaming branch as the FIRST sub-branch inside the !capture_active else-block, BEFORE the fork's host-D2H+H2D loop)\n\nFORK ANCHOR to wrap = the body at lines 12691-12744 (the `} else {` block: `int32_t host_selected[18];` ... through the `} /* !capture_active */`). I keep the host_selected D2H read (it is needed to build the streaming table's selected_ids on host too), then branch:\n\n```c\n} else {\n    int32_t host_selected[18];\n    cudaStream_t decode_stream = ds4_decode_stream();\n    cudaError_t ce = decode_stream ? cudaStreamSynchronize(decode_stream) : cudaSuccess;\n    if (ce == cudaSuccess) {\n        ce = cudaMemcpy(host_selected, selected->ptr,\n                        (size_t)n_expert * n_tokens * 4, cudaMemcpyDeviceToHost);\n    }\n    if (ce == cudaSuccess && g_ssd_streaming_mode) {\n        /* STREAMING: GPU-LRU (g_stream_expert_cache[compact_dev]) is backing store. */\n        ds4_gpu_stream_expert_table table;\n        table.model_map        = model_map;\n        table.model_size       = model_size;\n        table.layer            = g_routed_moe_cur_layer;   /* see SEAM-3 plumbing */\n        table.n_total_expert   = n_total_expert;\n        table.gate_offset      = gate_offset;\n        table.up_offset        = up_offset;\n        table.down_offset      = down_offset;\n        table.gate_expert_bytes= gate_expert_bytes;\n        table.down_expert_bytes= down_expert_bytes;\n        if (ds4_gpu_stream_expert_cache_prepare_selected_batch(\n                &table, host_selected, n_tokens, n_expert) &&\n            g_stream_selected_cache[compact_dev].valid) {\n            use_compact = 1;\n            use_stream  = 1;   /* new local, gates selected_ptr choice below */\n            gate_w = (const char *)g_stream_selected_cache[compact_dev].gate_ptr;\n            up_w   = (const char *)g_stream_selected_cache[compact_dev].up_ptr;\n            down_w = (const char *)g_stream_selected_cache[compact_dev].down_ptr;\n        }\n        /* fall through: if prepare failed (returned 0 / !valid), use_stream stays 0\n           and we drop into the existing g_moe_compact_* fill below as the safety net */\n    }\n    if (ce == cudaSuccess && !use_stream) {\n        use_compact = 1;\n        /* ... EXISTING fork loop verbatim: FORK 12707-12740 ... */\n    } else if (ce != cudaSuccess) {\n        (void)cudaGetLastError();\n    }\n}\n```\n\nAnd the selected_ptr pick (FORK 12781-12783) becomes three-way:\n```c\nconst int32_t *selected_ptr =\n    use_stream  ? g_stream_selected_cache[compact_dev].slot_selected_ptr :\n    use_compact ? g_moe_compact_selected_dev[compact_dev] :\n                  (const int32_t *)selected->ptr;\n```\nKEEP the entire existing g_moe_compact_* allocate+fill as the non-streaming else (it is the `!use_stream` arm above + the alloc block at 12646-12676, which stays unconditional — it is harmless to keep the compact scratch allocated even in streaming mode, or guard it with `if (!g_ssd_streaming_mode)` to save VRAM; I recommend the guard).\n\n### SEAM 1 — PER-DEVICE (the must-fix correctness bug)\nUpstream's `g_stream_selected_cache`, `g_stream_expert_cache`, and ALL the runtime-cap/budget statics (UP 194-200) are SINGLE globals. On our 7-GPU PP, layer L runs on device d=L%7 (or per the PP map); a single global cache holds device-d pointers, and the NEXT layer on device d' would (a) free device-d's cudaMalloc'd buffers while a graph on d still references them, and (b) hand device-d' a pointer that belongs to device-d's context → illegal-address fault or silent cross-device corruption. This is exactly why the fork already made g_moe_compact_* a [DS4_CUDA_MAX_DEVICES] array.\n\nFIX: when grafting the upstream statics, change to arrays indexed by compact_dev (the value already computed at FORK 12627-12629 via cudaGetDevice, clamped to [0,DS4_CUDA_MAX_DEVICES)):\n- `static cuda_stream_selected_cache g_stream_selected_cache[DS4_CUDA_MAX_DEVICES];`\n- `static cuda_stream_expert_cache  g_stream_expert_cache[DS4_CUDA_MAX_DEVICES];`\n- `static uint32_t g_stream_expert_runtime_cap[DS4_CUDA_MAX_DEVICES];` and the other runtime_* (gate_bytes/down_bytes/memory_cap_notice) likewise. `g_stream_expert_budget_override` and `g_ssd_streaming_mode` are policy-level (same on every GPU) → keep as scalars.\nEvery grafted helper that touches these globals must take/derive a `dev` and index `[dev]`: `cuda_stream_selected_cache_invalidate`, `cuda_stream_expert_cache_prepare` (UP 1820), `_find/_lru_slot/_load_slot/_copy_to_compact`, `cuda_stream_selected_cache_begin_compact_load` (UP 2875), and the public `prepare_selected_batch/seed_selected/seed_experts`. Simplest mechanical rule: at the TOP of each of these, do `int dev=0; cudaGetDevice(&dev); if(dev<0||dev>=DS4_CUDA_MAX_DEVICES)dev=0;` and replace `g_stream_selected_cache.` → `g_stream_selected_cache[dev].` and `g_stream_expert_cache` → `g_stream_expert_cache[dev]` (the .slots std::vector lives per element — fine). The budget/seed config wiring in ds4.c (SPEC step 5) must LOOP over devices: `for(d=0;d<n_dev;d++){cudaSetDevice(d); ds4_gpu_set_streaming_expert_cache_budget(...); seed...;}` — otherwise only device 0 is warmed and devices 1-6 cold-stream every token.\nFAILURE MODE if mishandled: intermittent `cudaErrorIllegalAddress` on the down/gate kernels for layers not on GPU0, or — worse — no error but wrong experts read (a buffer from another GPU's address space that happens to be mapped), i.e. silent garbage logits. Hard to debug because GPU0's layers look perfect.\n\n### SEAM 2 — CUDA GRAPH CAPTURE (the subtle one)\nThe fork's capture-active fast path (FORK 12686-12690) sets gate_w/up_w/down_w to `g_moe_compact_*[dev]` and does NO host work, because: the H2D fill + D2H selected-read happened on a PRIOR non-captured pass that left the buffer populated, and the captured graph only bakes (i) the fixed buffer POINTER and (ii) the kernel launch params. Replays reload buffer contents out-of-band. The streaming gather CANNOT run during capture: `prepare_selected_batch` does a host D2H (implicitly via the host_selected read I do before it), host std::vector LRU bookkeeping, cudaMalloc on miss-grow, and cudaMemcpy (non-async) of slot_ids (UP 3071) — every one of these is illegal inside cudaStreamBeginCapture and aborts the capture.\n\nCONCRETE SCHEME (pre-seed-before-replay, mirroring what the compact path already relies on):\n1. In the capture_active branch, do NOT call the streaming gather. Instead point at the streaming buffers that a prior non-captured prime pass populated:\n```c\nif (capture_active) {\n    use_compact = 1;\n    if (g_ssd_streaming_mode && g_stream_selected_cache[compact_dev].valid) {\n        use_stream = 1;\n        gate_w = g_stream_selected_cache[compact_dev].gate_ptr;\n        up_w   = g_stream_selected_cache[compact_dev].up_ptr;\n        down_w = g_stream_selected_cache[compact_dev].down_ptr;\n    } else { gate_w = g_moe_compact_gate[compact_dev]; ... }\n}\n```\n2. POINTER STABILITY is the precondition. `cuda_stream_selected_ensure_bytes` (UP 1763) only reallocs when bytes>capacity. For decode n_tokens=1 the compact_count is ≤6 and monotonic-capped, so after the first prime pass the pointer is stable and safe to bake. To GUARANTEE it: in streaming mode size the selected cache to the WORST case (compact_count = min(n_total_expert, n_tokens*n_expert)) on the prime pass so capacity never grows post-capture — add a one-time `prepare` with a full-6-unique selection during warmup, or force `cuda_stream_selected_ensure_bytes` to `n_expert*n_tokens*expert_bytes` (not the dedup count) so the allocation is capture-invariant.\n3. THE DATA-CONTENT REPLAY PROBLEM (this is the real teeth): unlike the compact path whose buffer is refilled by a kernel/patch inside replay, the streaming buffer is filled by HOST-side LRU copies that DON'T run during graph replay. A captured+replayed graph would read STALE expert weights from the prior step. Therefore: for streamed layers, the streaming gather (prepare_selected_batch) MUST execute on the decode stream OUTSIDE capture, immediately before `ds4_gpu_decode_graph_launch`/`pp_chunk_graph_launch`, every decode step. Two valid implementations:\n   (a) PREFERRED — DISABLE graph capture for layers whose experts are streamed. Gate `cuda_decode_graph_enabled()`/the subgraph capture (FORK ds4_gpu_decode_subgraph_capture ~263, pp_chunk_graph_capture_begin 304) with `&& !(g_ssd_streaming_mode)` for MoE-bearing layers. The launch/D2H cost the graph was hiding is dwarfed by the SSD/RAM→HBM expert copy in streaming mode anyway (per DS4 decode-bottleneck memory, decode is launch-bound at ~25 t/s on the resident model; streaming adds copy latency that makes graph savings negligible). This is the safe, correct default — ship this first.\n   (b) ADVANCED — keep the graph but split the step: run `prepare_selected_batch` for ALL streamed layers on the decode stream (non-captured) to pre-seed every per-layer g_stream_selected_cache, THEN replay the graph. This requires per-layer selected caches (not one per device) so layer L's buffer isn't overwritten by layer L+1 before replay — i.e. g_stream_selected_cache becomes [dev][layer], a large VRAM cost (6 experts * ~bytes * n_layers_on_dev). Only worth it if (a) proves too slow. Document as future work.\nFAILURE MODE if mishandled: if the gather runs during capture → `cudaErrorStreamCaptureUnsupported`, capture aborts, decode silently falls back to per-step (or hangs in PP if the abort path isn't clean). If capture succeeds but the host fill is skipped on replay → CORRECT-LOOKING run with WRONG logits (reads last step's experts), the nastiest failure: no crash, just quality collapse that looks like a quant bug.\n\n### SEAM 3 — layer-index plumbing gap (NEW, I found this; flag for orchestrator)\nThe streaming table needs `table.layer` to key the GPU-LRU per layer. But the DECODE entry `ds4_gpu_routed_moe_one_tensor` (FORK 13311) does NOT receive a layer index, and the batch entry `ds4_gpu_routed_moe_batch_tensor` (13320) receives `layer_index` but `(void)`-discards it (13321). routed_moe_launch has no layer param. Without a real layer id, every layer's experts collide in the LRU under layer=0 → the cache treats expert 5 of layer 3 and expert 5 of layer 40 as the same slot → massive false-hit corruption (returns wrong layer's weights). FIX: thread a layer id into routed_moe_launch — either add a param (touches 2 call sites + both extern entry signatures, which ds4.c calls) OR set a file-scope `static __thread uint32_t g_routed_moe_cur_layer;` from the batch entry's layer_index and from a new layer arg on the one-tensor entry. The seed-experts hotlist path needs the same id. This MUST be resolved or the LRU is unusable; recommend the explicit param to avoid TLS-vs-PP-thread surprises.",
+   "fork_edits": [
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_cuda.cu",
+     "anchor": "static char *g_moe_compact_gate[DS4_CUDA_MAX_DEVICES];",
+     "action": "insert_before",
+     "content": "/* Streaming expert cache: per-device, mirrors g_moe_compact_* indexing.\n * UPSTREAM ds4_cuda.cu:132-185 (structs) + 194-200 (globals) grafted here,\n * but the two cache structs + runtime caps become [DS4_CUDA_MAX_DEVICES]\n * arrays because PP runs each layer on a different GPU. g_ssd_streaming_mode\n * and g_stream_expert_budget_override stay scalar (policy, same on all GPUs). */\nstatic int g_ssd_streaming_mode;\nstatic cuda_stream_selected_cache g_stream_selected_cache[DS4_CUDA_MAX_DEVICES];\nstatic cuda_stream_expert_cache  g_stream_expert_cache[DS4_CUDA_MAX_DEVICES];\n/* layer id threaded into routed_moe_launch for per-layer LRU keying (SEAM 3) */\nstatic uint32_t g_routed_moe_cur_layer;\n"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_cuda.cu",
+     "anchor": "            if (capture_active) {\n                use_compact = 1;\n                gate_w = g_moe_compact_gate[compact_dev];\n                up_w   = g_moe_compact_up[compact_dev];\n                down_w = g_moe_compact_down[compact_dev];\n            } else {",
+     "action": "replace",
+     "content": "            int use_stream = 0;\n            if (capture_active) {\n                /* SEAM 2: no host work during capture. Point at buffers a prior\n                 * non-captured prime pass populated. Streamed layers SHOULD have\n                 * graph capture disabled (see SEAM 2 (a)); this branch is the\n                 * belt-and-suspenders fallback if a streamed layer is captured. */\n                use_compact = 1;\n                if (g_ssd_streaming_mode && g_stream_selected_cache[compact_dev].valid) {\n                    use_stream = 1;\n                    gate_w = (const char *)g_stream_selected_cache[compact_dev].gate_ptr;\n                    up_w   = (const char *)g_stream_selected_cache[compact_dev].up_ptr;\n                    down_w = (const char *)g_stream_selected_cache[compact_dev].down_ptr;\n                } else {\n                    gate_w = g_moe_compact_gate[compact_dev];\n                    up_w   = g_moe_compact_up[compact_dev];\n                    down_w = g_moe_compact_down[compact_dev];\n                }\n            } else {"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_cuda.cu",
+     "anchor": "            if (ce == cudaSuccess) {\n                use_compact = 1;\n                /* Copy each selected expert's weights to compact scratch per token */",
+     "action": "insert_before",
+     "content": "            if (ce == cudaSuccess && g_ssd_streaming_mode) {\n                /* STREAMING gather: GPU-LRU g_stream_expert_cache[dev] backs this.\n                 * Replaces the direct mmap->H2D loop below. UPSTREAM entry is\n                 * ds4_gpu_stream_expert_cache_prepare_selected_batch (UP 3176). */\n                ds4_gpu_stream_expert_table table;\n                table.model_map         = model_map;\n                table.model_size        = model_size;\n                table.layer             = g_routed_moe_cur_layer;\n                table.n_total_expert    = n_total_expert;\n                table.gate_offset       = gate_offset;\n                table.up_offset         = up_offset;\n                table.down_offset       = down_offset;\n                table.gate_expert_bytes = gate_expert_bytes;\n                table.down_expert_bytes = down_expert_bytes;\n                if (ds4_gpu_stream_expert_cache_prepare_selected_batch(\n                        &table, host_selected, n_tokens, n_expert) &&\n                    g_stream_selected_cache[compact_dev].valid) {\n                    use_compact = 1;\n                    use_stream  = 1;\n                    gate_w = (const char *)g_stream_selected_cache[compact_dev].gate_ptr;\n                    up_w   = (const char *)g_stream_selected_cache[compact_dev].up_ptr;\n                    down_w = (const char *)g_stream_selected_cache[compact_dev].down_ptr;\n                }\n                /* if prepare failed, use_stream stays 0 -> fall through to the\n                 * existing g_moe_compact_* fill (safety net) */\n            }\n            if (ce == cudaSuccess && !use_stream) {"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_cuda.cu",
+     "anchor": "    const int32_t *selected_ptr = use_compact\n        ? g_moe_compact_selected_dev[compact_dev]\n        : (const int32_t *)selected->ptr;",
+     "action": "replace",
+     "content": "    const int32_t *selected_ptr =\n        use_stream  ? g_stream_selected_cache[compact_dev].slot_selected_ptr :\n        use_compact ? g_moe_compact_selected_dev[compact_dev] :\n                      (const int32_t *)selected->ptr;"
+    }
+   ],
+   "new_gpu_apis_called_from_shared_ds4c": [
+    "ds4_gpu_set_ssd_streaming(bool) — already exists in upstream ds4_gpu.h:74; called from ds4.c engine config. Plain C signature, needs Metal stub (returns void, no-op) OR the ds4.c call wrapped in #ifndef __APPLE__.",
+    "ds4_gpu_set_streaming_expert_cache_budget(uint32_t) — ds4_gpu.h:75; called per-device in ds4.c warm loop. Needs Metal stub (no-op) or #ifndef __APPLE__ guard.",
+    "ds4_gpu_stream_expert_cache_seed_experts(const ds4_gpu_stream_expert_table*, const int32_t*, const uint32_t*, uint32_t) — ds4_gpu.h:124; called from ds4.c hotlist seeding. Needs Metal stub or guard.",
+    "ds4_gpu_stream_expert_cache_prepare_selected_batch(...) — ds4_gpu.h:107, ALREADY guarded upstream by #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__)). It is called only from ds4_cuda.cu (inside routed_moe_launch), NOT from ds4.c, so no Metal stub needed — but keep the existing header guard. NOTE: this is an internal-to-CUDA call, so the Metal rule does not bite here.",
+    "ds4_gpu_set_model_map_spans / ds4_gpu_set_streaming_expert_cache_expert_bytes — ds4_gpu.h:61,76; if newly wired from ds4.c, each needs a Metal no-op stub or #ifndef __APPLE__ at the ds4.c call site."
+   ],
+   "graph_capture_handling": "PREFERRED (ship first): disable CUDA graph capture for MoE-bearing layers whenever g_ssd_streaming_mode!=0. Gate the subgraph capture (ds4_gpu_decode_subgraph_capture ~FORK 263) and pp_chunk_graph_capture_begin (FORK 304) so streamed layers are NOT captured; the streaming gather then runs eagerly on the decode stream each step (host D2H of selected ids + LRU bookkeeping + RAM/SSD->HBM copies + slot_ids upload — all illegal inside capture). Rationale: in streaming mode decode is dominated by the expert copy latency, so the launch-overhead savings a captured graph provides are negligible, and eager execution is the only way the host-side LRU fill is guaranteed to run before the kernels read the buffer. ADVANCED (future): keep the graph by pre-seeding — run prepare_selected_batch for every streamed layer on a non-captured stream to fill per-(dev,layer) selected caches, then replay; requires g_stream_selected_cache[dev][layer] (big VRAM) so layer L's buffer survives until its replay. Pointer stability for any captured streamed layer must be ensured by sizing cuda_stream_selected_ensure_bytes to the worst case (n_tokens*n_expert*expert_bytes, not the dedup compact_count) on the prime pass so no post-capture cudaMalloc realloc invalidates the baked pointer. FAILURE MODES: gather-during-capture -> cudaErrorStreamCaptureUnsupported (capture aborts / PP may hang); capture-without-host-refill-on-replay -> NO crash but reads previous step's experts -> silent logit/quality collapse that masquerades as a quant bug.",
+   "per_device_adaptation": "Index every grafted streaming global by compact_dev (already computed at FORK 12627-12629). Convert upstream singles to arrays: g_stream_selected_cache[DS4_CUDA_MAX_DEVICES], g_stream_expert_cache[DS4_CUDA_MAX_DEVICES], and the runtime caps g_stream_expert_runtime_cap/_runtime_gate_bytes/_runtime_down_bytes/_memory_cap_notice[DS4_CUDA_MAX_DEVICES]. Keep g_ssd_streaming_mode and g_stream_expert_budget_override scalar (policy). In each grafted helper (cuda_stream_selected_cache_invalidate, cuda_stream_expert_cache_prepare/_find/_lru_slot/_load_slot/_copy_to_compact, cuda_stream_selected_cache_begin_compact_load, and the public prepare_selected_batch/seed_selected/seed_experts) add at top: int dev=0; cudaGetDevice(&dev); if(dev<0||dev>=DS4_CUDA_MAX_DEVICES)dev=0; then index [dev] on all g_stream_* accesses. In ds4.c the budget-set and hotlist-seed config MUST loop over all devices (cudaSetDevice(d) per iteration) or only GPU0 is warmed. Failure if not done per-device: cudaErrorIllegalAddress on non-GPU0 layers, or silent cross-device wrong-weight reads (garbage logits that look perfect on GPU0's layers).",
+   "metal_stub_draft": "/* ds4_metal.m — no-op stubs so the shared ds4.c links on Apple (CUDA never */\n/* compiles ds4_metal.o, so any ds4_gpu_* called from ds4.c needs a stub here */\n/* OR a #ifndef __APPLE__ guard at the ds4.c call site).                       */\nvoid ds4_gpu_set_ssd_streaming(bool enabled) { (void)enabled; }\nvoid ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) { (void)experts; }\nvoid ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) { (void)bytes; }\nuint32_t ds4_gpu_stream_expert_cache_configured_count(void) { return 0; }\nuint32_t ds4_gpu_stream_expert_cache_current_count(void) { return 0; }\nvoid ds4_gpu_stream_expert_cache_reset_route_hotness(void) {}\nvoid ds4_gpu_stream_expert_cache_release_resident(void) {}\nuint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(uint64_t g, uint64_t d) { (void)g;(void)d; return 0; }\nint ds4_gpu_stream_expert_cache_seed_selected(const ds4_gpu_stream_expert_table *t, const int32_t *ids, uint32_t n) { (void)t;(void)ids;(void)n; return 1; }\nint ds4_gpu_stream_expert_cache_begin_selected_load(const ds4_gpu_stream_expert_table *t, const int32_t *ids, uint32_t n) { (void)t;(void)ids;(void)n; return 1; }\nint ds4_gpu_stream_expert_cache_seed_experts(const ds4_gpu_stream_expert_table *t, const int32_t *ids, const uint32_t *pri, uint32_t n) { (void)t;(void)ids;(void)pri;(void)n; return 1; }\n/* NOTE: ds4_gpu_stream_expert_cache_prepare_selected_batch is NOT stubbed: it is */\n/* called only from inside ds4_cuda.cu (never from ds4.c) and is already wrapped  */\n/* in #if !defined(__APPLE__) in ds4_gpu.h:106-112, so it does not exist on Apple. */",
+   "upstream_sources": [
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "132-185",
+     "symbols": "struct cuda_stream_selected_cache, struct cuda_stream_expert_cache_slot, struct cuda_stream_expert_cache",
+     "purpose": "Graft verbatim above the fork's g_moe_compact_* declarations (~FORK 630). slot_selected_tensor (a ds4_gpu_tensor) and {gate,up,down}_ptr + slot_selected_ptr are the fields routed_moe_launch reads."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "194-200",
+     "symbols": "g_stream_selected_cache, g_stream_expert_cache, g_stream_expert_budget_override, g_stream_expert_runtime_cap, g_stream_expert_memory_cap_notice, g_stream_expert_runtime_gate_bytes, g_stream_expert_runtime_down_bytes",
+     "purpose": "Globals — convert the two caches + runtime_cap/runtime_*_bytes/memory_cap_notice to [DS4_CUDA_MAX_DEVICES] arrays (SEAM 1); keep budget_override scalar."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "1763-1818",
+     "symbols": "cuda_stream_selected_ensure_bytes, cuda_stream_selected_ensure_i32",
+     "purpose": "Allocators for the selected cache. Realloc-only-on-grow is the pointer-stability lever for graph capture (SEAM 2 step 2)."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "1412-1451",
+     "symbols": "cuda_stream_selected_cache_invalidate, cuda_stream_expert_cache_release_all/invalidate",
+     "purpose": "Invalidation helpers — index per-device when grafted."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "1820-2240",
+     "symbols": "cuda_stream_expert_cache_prepare, _find, _lru_slot, _load_slot, _copy_to_compact, _seed_one, cuda_model_copy_to_device_streamed",
+     "purpose": "GPU-LRU backing-store engine + the one missing I/O helper (cuda_model_copy_to_device_streamed @2152, rides our existing stage_read). All g_stream_* refs -> [dev]."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "2875-3115",
+     "symbols": "cuda_stream_selected_cache_begin_compact_load",
+     "purpose": "The core dedup+LRU-probe+SSD-fallback+D2D loop. Writes g_stream_selected_cache[dev].{gate,up,down}_ptr (dedup-packed) + slot_selected_ptr/tensor. This is the function our routed_moe_launch streaming branch ultimately drives."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "3176-3244",
+     "symbols": "ds4_gpu_stream_expert_cache_prepare_selected_batch",
+     "purpose": "The exact decode hook called from the fork's new streaming branch. Builds dedup compact_ids + per-pair slot_ids from host_selected, then calls begin_compact_load. Note strict_failure=1, allow_global_cache=0 here (vs seed_selected which uses 0,1)."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cuda.cu",
+     "region": "3246-3340",
+     "symbols": "ds4_gpu_stream_expert_cache_seed_experts, ds4_gpu_set_ssd_streaming, _set_streaming_expert_cache_budget, _configured/current_count",
+     "purpose": "Hotlist seed + config setters wired from ds4.c (must loop devices). seed_experts needs a real layer id (SEAM 3)."
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_gpu.h",
+     "region": "74-128",
+     "symbols": "ds4_gpu_stream_expert_table struct + prototypes",
+     "purpose": "Add to fork ds4_gpu.h verbatim. prepare_selected_batch already #if-guarded for Apple (106-112); the void/int config setters are NOT guarded so they need Metal stubs."
+    }
+   ],
+   "risks": [
+    "SEAM 3 (layer id) is a hard blocker I discovered: ds4_gpu_routed_moe_one_tensor (decode, FORK 13311) passes no layer index and routed_moe_launch has no layer param, yet the GPU-LRU keys cache slots by (model_map,layer,expert). Without a real layer id every layer collides under layer=0 -> false LRU hits return another layer's expert weights -> silent garbage. MUST thread a layer id (prefer explicit param on both extern entries + routed_moe_launch; the batch entry already receives layer_index but discards it at 13321). Until fixed, the streaming path is unusable.",
+    "Dedup vs per-pair layout mismatch is safe ONLY because I redirect selected_ptr to slot_selected_ptr in lockstep with the three weight bases. If a future edit sets gate_w/up_w/down_w from the stream cache but leaves selected_ptr on g_moe_compact_selected_dev (or selected->ptr), the kernels index dedup-packed weights with per-pair/raw indices -> out-of-bounds reads / wrong experts. The three-way selected_ptr ternary must stay coupled to use_stream.",
+    "Graph capture: if SEAM 2 (a) is not applied and a streamed MoE layer gets captured, the host LRU fill is skipped on replay -> reads prior step's experts -> quality collapse with no crash (worst debugging case). Ship with capture disabled for streamed layers first.",
+    "O_DIRECT vs page-cache (SPEC risk 3): cuda_model_copy_to_device_streamed's default DONTNEED + O_DIRECT bypasses the 1024GB page cache the whole streaming strategy depends on. DS4_CUDA_KEEP_MODEL_PAGES=1 + DS4_CUDA_NO_DIRECT_IO=1 must be set together or every miss hits Optane. Not a code bug but a config landmine that makes streaming look broken (slow).",
+    "Per-device VRAM: 7 copies of g_stream_expert_cache slots[] (the LRU) + per-device selected caches. The budget (DS4_CUDA_STREAMING_EXPERT_CACHE_N / RESERVE_GB) is per-GPU; on 16GB cards with KV+scratch reserved, an over-large budget OOMs on devices that also hold resident non-MoE weights. Verbose hit/miss logging per device is needed to tune.",
+    "cuda_model_copy_to_device_streamed rides our fork's cuda_model_stage_read/fd plumbing (SPEC risk 5) which may have diverged from upstream's quad-buffer event model (UP 214-222 g_model_stage*). Diff before grafting; if the staging event model differs, the streamed copy can race (read stale staging buffer) -> intermittent wrong weights.",
+    "Metal: the config setters (set_ssd_streaming, set_streaming_expert_cache_budget, seed_experts, etc.) are called from shared ds4.c and are NOT Apple-guarded in the header -> without the Metal stubs above, ds4_metal.o fails to link and the Mac build breaks invisibly (CUDA build never compiles ds4_metal.o, so CI on this box won't catch it)."
+   ]
+  },
+  {
+   "component": "engine-wiring + Metal stubs (FORK ds4.h / ds4.c / ds4_cli.c / ds4_metal.m / Makefile)",
+   "summary": "Mapped the fork's diverged option/engine/CLI/Metal layout against upstream e34a808 and produced surgical edits for engine-wiring + the 6 Metal no-op stubs.\n\nKEY DIVERGENCE FINDINGS (load-bearing):\n1. The fork's `ds4_engine_options` (ds4.h:63-77) is the SMALL legacy version — it lacks ALL six ssd_streaming*/simulate fields. Upstream's full struct (ds4.h:94-121) also has expert_profile_path/load_slice/prefill_chunk/distributed; we add ONLY the six the SPEC names.\n2. The fork's ds4.c has ZERO ssd_streaming references and NO `ds4_backend_supports_ssd_streaming` — must be added.\n3. CRITICAL BLOCKER for the span path: upstream's `--ssd-streaming` span-restricted `ds4_gpu_set_model_map_spans` block (upstream ds4.c:25775-25839) depends on `weights_model_map_token_spans`, `weights_model_map_decode_static_slice_spans`, `weights_have_output_head`, `ds4_model_map_span_vec`, `weights_streaming_non_routed_bytes`, `ds4_streaming_routed_expert_bytes`, `weights_streaming_layer_experts_uniform`, `ds4_streaming_cache_experts_for_byte_budget`, `ds4_streaming_manual_cache_safe_bytes` — grep confirms NONE exist in the fork (it has the simple 2-arg `weights_bind` at ds4.c:3177, not the 7-arg slice version). So the span path and byte-budget→experts conversion CANNOT be grafted in this component; they belong to a 'weights-streaming' component. My engine wiring is therefore the MINIMAL-SAFE version: copy opt->e fields, call `ds4_gpu_set_ssd_streaming(e->ssd_streaming)` + `ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts)` (count-only; byte budget left for the weights component), keep the existing full `ds4_gpu_set_model_map_range` path unchanged. The span restriction (DS4_CUDA_KEEP_MODEL_PAGES makes full map acceptable initially anyway) is flagged as a follow-up.\n4. The auto-cache (`ds4_engine_configure_streaming_auto_cache`) is a no-op for our CUDA build: upstream `ds4_backend_supports_streaming_auto_cache` returns false for CUDA on non-ROCm builds. Safe to omit; CLI count/GB is the path.\n5. `ds4_ssd.c`/`ds4_ssd.h` are self-contained plain C (only need ds4_ssd.h); they hold the CLI parse helpers `ds4_parse_gib_arg`/`ds4_parse_streaming_cache_experts_arg` AND `ds4_ssd_memory_lock_*`. Upstream brings ds4_ssd.h in via ds4.h (upstream ds4.h:9). I replicate that so ds4.c + ds4_cli.c get the helpers transitively.\n6. BUILD RISK: the fork Makefile CORE_OBJS = `ds4.o ds4_cuda.o` (and `ds4.o ds4_metal.o` on Darwin) has NO `ds4_ssd.o`. Since CLI now calls ds4_parse_* and engine close calls ds4_ssd_memory_lock_release, `ds4_ssd.o` MUST be added to CORE_OBJS on BOTH branches (CUDA, Metal) and the CPU branch too (ds4_cli is shared) or the link fails with undefined refs.\n7. HOTLIST PLACEMENT CORRECTION: SPEC step (e) says include `ds4_streaming_hotlist.inc` in ds4.c, but the fork's ds4.c has NO `metal_graph_streaming_expert_hotlist_*` consumers (upstream's only consumers). Including it in ds4.c yields unused file-scope `static const` arrays → clang's -Wunused-const-variable (in -Wall) would warn (fork CFLAGS = -Wall -Wextra, no -Werror, so non-fatal, but noisy). The real consumer is the CUDA seed path in ds4_cuda.cu (DS4_CUDA_ENABLE_STREAMING_EXPERT_HOTLIST). RECOMMEND: the CUDA component `#include`s the .inc in ds4_cuda.cu, NOT ds4.c. I did NOT add it to ds4.c.\n\nMETAL STUBS: fork ds4_metal.m already has real `ds4_gpu_set_model_map_range` (4867) + no-op `ds4_gpu_set_model_fd` (4912). It is MISSING stubs for the 6 streaming APIs and has NONE of the streaming globals (g_ssd_streaming_mode, g_stream_expert_cache). Per the METAL-SAFETY RULE all 6 get disabled/no-op stubs (Metal=single-device, no streaming) inserted right after ds4_gpu_set_model_fd. `set_model_map_spans` delegates to the existing range mapper so the Metal build still maps the model.",
+   "new_gpu_apis_called_from_shared_ds4c": [
+    "ds4_gpu_set_ssd_streaming(bool) — called in ds4_engine_open after ds4_gpu_set_quality; Metal stub provided (no-op).",
+    "ds4_gpu_set_streaming_expert_cache_budget(uint32_t) — called in ds4_engine_open with e->ssd_streaming_cache_experts; Metal stub provided (no-op).",
+    "ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t) — NOT called in this minimal wiring (needs ds4_streaming_routed_expert_bytes from the weights component) but Metal stub provided proactively so the CUDA-side wiring can call it without breaking the Mac build.",
+    "ds4_gpu_recommended_working_set_size(void) — NOT called in this minimal wiring (only used by the deferred auto-cache, a CUDA no-op) but Metal stub provided proactively.",
+    "ds4_gpu_set_model_map_spans(...) — NOT called in this minimal wiring (span path deferred until weights helpers land) but Metal stub provided proactively; delegates to ds4_gpu_set_model_map_range.",
+    "ds4_gpu_set_model_fd_for_map(int,const void*) — NOT called from ds4.c in this wiring (it is reconciled inside ds4_cuda.cu per SPEC step 2) but Metal stub provided proactively for the Mac build.",
+    "ds4_ssd_memory_lock_release(...) / ds4_ssd_memory_lock_acquire(...) — plain-C (ds4_ssd.c), not ds4_gpu_*; no Metal stub needed, but ds4_ssd.o must be linked (Makefile risk #6)."
+   ],
+   "fork_edits": [
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4.h",
+     "anchor": "#include <stdio.h>\n",
+     "action": "insert_after",
+     "content": "\n#include \"ds4_ssd.h\"\n"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4.h",
+     "anchor": "    int power_percent;\n    bool warm_weights;\n    bool quality;\n    bool inspect_only;\n} ds4_engine_options;",
+     "action": "replace",
+     "content": "    int power_percent;\n    uint32_t ssd_streaming_cache_experts;\n    uint64_t ssd_streaming_cache_bytes;\n    uint32_t ssd_streaming_preload_experts;\n    uint64_t simulate_used_memory_bytes;\n    bool warm_weights;\n    bool quality;\n    bool ssd_streaming;\n    bool ssd_streaming_cold;\n    bool inspect_only;\n} ds4_engine_options;"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4.c",
+     "anchor": "static bool ds4_backend_uses_graph(",
+     "action": "insert_before",
+     "content": "static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {\n    if (backend == DS4_BACKEND_METAL) return true;\n    if (backend == DS4_BACKEND_CUDA) {\n#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))\n        return true;\n#else\n        return false;\n#endif\n    }\n    return false;\n}\n\n"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4.c",
+     "anchor": "    int power_percent;\n    bool quality;\n    bool metal_ready;\n    bool mtp_ready;\n};",
+     "action": "replace",
+     "content": "    int power_percent;\n    uint32_t ssd_streaming_cache_experts;\n    uint64_t ssd_streaming_cache_bytes;\n    uint32_t ssd_streaming_preload_experts;\n    ds4_ssd_memory_lock simulated_memory;\n    bool quality;\n    bool ssd_streaming;\n    bool ssd_streaming_cold;\n    bool metal_ready;\n    bool mtp_ready;\n};"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4.c",
+     "anchor": "    e->backend = opt->backend;\n    e->quality = opt->quality;\n    e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;",
+     "action": "replace",
+     "content": "    e->backend = opt->backend;\n    e->quality = opt->quality;\n    e->ssd_streaming = opt->ssd_streaming;\n    e->ssd_streaming_cold = opt->ssd_streaming_cold;\n    e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;\n    e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;\n    e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;\n    e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4.c",
+     "anchor": "    if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;\n    ds4_acquire_instance_lock();",
+     "action": "replace",
+     "content": "    if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;\n    ds4_acquire_instance_lock();\n\n    if (opt->simulate_used_memory_bytes != 0 &&\n        !ds4_ssd_memory_lock_acquire(&e->simulated_memory,\n                                     opt->simulate_used_memory_bytes)) {\n        ds4_engine_close(e);\n        *out = NULL;\n        return 1;\n    }\n    if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {\n        fprintf(stderr, \"ds4: --ssd-streaming is currently supported only with --metal/--cuda\\n\");\n        ds4_engine_close(e);\n        *out = NULL;\n        return 1;\n    }"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4.c",
+     "anchor": "        ds4_gpu_set_quality(e->quality);\n        (void)ds4_gpu_set_model_fd(e->model.fd);",
+     "action": "replace",
+     "content": "        ds4_gpu_set_quality(e->quality);\n        ds4_gpu_set_ssd_streaming(e->ssd_streaming);\n        /*\n         * NOTE (engine-wiring component): only the count-based GPU-LRU budget\n         * is wired here. The byte-budget -> expert-count conversion and the\n         * --ssd-streaming span-restricted ds4_gpu_set_model_map_spans path\n         * (upstream ds4.c:25643-25839) depend on weights-layer helpers\n         * (weights_model_map_token_spans, ds4_streaming_routed_expert_bytes,\n         * ds4_streaming_cache_experts_for_byte_budget, ...) that DO NOT exist\n         * in this fork. They must be added by the weights-streaming component;\n         * until then ssd_streaming relies on the full ds4_gpu_set_model_map_range\n         * below plus DS4_CUDA_KEEP_MODEL_PAGES=1 for residency.\n         */\n        ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);\n        (void)ds4_gpu_set_model_fd(e->model.fd);"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4.c",
+     "anchor": "void ds4_engine_close(ds4_engine *e) {\n    if (!e) return;\n    weights_free(&e->weights);",
+     "action": "replace",
+     "content": "void ds4_engine_close(ds4_engine *e) {\n    if (!e) return;\n    ds4_ssd_memory_lock_release(&e->simulated_memory);\n    weights_free(&e->weights);"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_cli.c",
+     "anchor": "#include \"ds4.h\"\n#include \"linenoise.h\"",
+     "action": "replace",
+     "content": "#include \"ds4.h\"\n#include \"ds4_ssd.h\"\n#include \"linenoise.h\""
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_cli.c",
+     "anchor": "        } else if (!strcmp(arg, \"--quality\")) {\n            c.engine.quality = true;\n        } else if (!strcmp(arg, \"--power\")) {",
+     "action": "replace",
+     "content": "        } else if (!strcmp(arg, \"--quality\")) {\n            c.engine.quality = true;\n        } else if (!strcmp(arg, \"--ssd-streaming\")) {\n            c.engine.ssd_streaming = true;\n        } else if (!strcmp(arg, \"--ssd-streaming-cold\")) {\n            c.engine.ssd_streaming_cold = true;\n        } else if (!strcmp(arg, \"--ssd-streaming-cache-experts\")) {\n            uint32_t experts = 0;\n            uint64_t bytes = 0;\n            if (!ds4_parse_streaming_cache_experts_arg(\n                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {\n                fprintf(stderr,\n                        \"ds4: --ssd-streaming-cache-experts must be a positive count or <number>GB\\n\");\n                exit(2);\n            }\n            c.engine.ssd_streaming_cache_experts = experts;\n            c.engine.ssd_streaming_cache_bytes = bytes;\n        } else if (!strcmp(arg, \"--ssd-streaming-preload-experts\")) {\n            int v = parse_int(need_arg(&i, argc, argv, arg), arg);\n            if (v <= 0) {\n                fprintf(stderr, \"ds4: --ssd-streaming-preload-experts must be positive\\n\");\n                exit(2);\n            }\n            c.engine.ssd_streaming_preload_experts = (uint32_t)v;\n        } else if (!strcmp(arg, \"--simulate-used-memory\")) {\n            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),\n                                   &c.engine.simulate_used_memory_bytes)) {\n                fprintf(stderr,\n                        \"ds4: --simulate-used-memory must be a positive GiB value, e.g. 64GB\\n\");\n                exit(2);\n            }\n        } else if (!strcmp(arg, \"--power\")) {"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_cli.c",
+     "anchor": "        \"  --quality\\n\"\n        \"      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\\n\"",
+     "action": "replace",
+     "content": "        \"  --quality\\n\"\n        \"      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\\n\"\n        \"  --ssd-streaming\\n\"\n        \"      CUDA/Metal: opt in to SSD-backed expert streaming instead of full residency.\\n\"\n        \"  --ssd-streaming-cold\\n\"\n        \"      SSD streaming: skip default popularity-based expert-cache preload.\\n\"\n        \"  --ssd-streaming-cache-experts N|NGB\\n\"\n        \"      SSD streaming: per-GPU routed expert LRU as expert count or GiB (e.g. 12GB).\\n\"\n        \"  --ssd-streaming-preload-experts N\\n\"\n        \"      SSD streaming: upfront popularity preload count.\\n\"\n        \"  --simulate-used-memory NGB\\n\"\n        \"      Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.\\n\""
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/ds4_metal.m",
+     "anchor": "int ds4_gpu_set_model_fd(int fd) {\n    (void)fd;\n    return 1;\n}",
+     "action": "insert_after",
+     "content": "\n/*\n * SSD expert-streaming is single-device CUDA-only in this fork. Metal builds\n * are single-device and do not implement the streaming expert cache, so these\n * are disabled/no-op stubs (METAL-SAFETY RULE: every ds4_gpu_* that the shared\n * ds4.c can call must have a Metal stub or be #ifndef __APPLE__-guarded).\n */\nvoid ds4_gpu_set_ssd_streaming(bool enabled) {\n    if (enabled) {\n        fprintf(stderr,\n                \"ds4: SSD expert streaming is not implemented for the Metal backend; \"\n                \"ignoring --ssd-streaming\\n\");\n    }\n}\n\nvoid ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {\n    (void)experts;\n}\n\nvoid ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {\n    (void)bytes;\n}\n\nuint64_t ds4_gpu_recommended_working_set_size(void) {\n    return 0;\n}\n\nint ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {\n    (void)fd;\n    (void)model_map;\n    return 1;\n}\n\nint ds4_gpu_set_model_map_spans(\n        const void *model_map,\n        uint64_t    model_size,\n        const uint64_t *offsets,\n        const uint64_t *sizes,\n        uint32_t    count,\n        uint64_t    max_tensor_bytes) {\n    /*\n     * No multi-span model views on Metal in this fork: map the full model so\n     * non-streaming Metal still works. offsets/sizes describe the streaming\n     * restriction we intentionally ignore here.\n     */\n    (void)offsets;\n    (void)sizes;\n    (void)count;\n    (void)max_tensor_bytes;\n    return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);\n}\n"
+    }
+   ],
+   "risks": [
+    "see risks above"
+   ],
+   "metal_stub_draft": "All 6 Metal stubs are in fork_edits (insert_after ds4_gpu_set_model_fd at ds4_metal.m:4915). Summary of behavior: ds4_gpu_set_ssd_streaming -> warns once + no-op (streaming unimplemented on Metal); ds4_gpu_set_streaming_expert_cache_budget/_expert_bytes -> (void) no-op; ds4_gpu_recommended_working_set_size -> return 0 (auto-cache treats 0 as 'unavailable'); ds4_gpu_set_model_fd_for_map -> return 1 (matches existing ds4_gpu_set_model_fd no-op); ds4_gpu_set_model_map_spans -> delegates to existing ds4_gpu_set_model_map_range(map,size,0,size,0) so Metal still maps the full model (ignores the streaming span restriction). Prototypes for these 6 must be added to ds4_gpu.h by the ds4_gpu.h/ds4_cuda.cu component (fork ds4_gpu.h has only ds4_gpu_set_model_fd:44 and ds4_gpu_set_model_map_range:45 today); without the prototypes the C call sites in ds4.c emit implicit-declaration warnings and the Metal definitions are unmatched.",
+   "upstream_sources": [
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4.h",
+     "region": "9 (include) and 94-121 (ds4_engine_options)",
+     "symbols": "#include \"ds4_ssd.h\"; ssd_streaming_cache_experts/cache_bytes/preload_experts, simulate_used_memory_bytes, ssd_streaming, ssd_streaming_cold"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4.c",
+     "region": "79-89",
+     "symbols": "ds4_backend_supports_ssd_streaming (copy verbatim into fork ds4.c)"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4.c",
+     "region": "21828-21834",
+     "symbols": "internal struct ds4_engine streaming fields incl ds4_ssd_memory_lock simulated_memory"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4.c",
+     "region": "25557-25564, 25585-25591, 25730-25736",
+     "symbols": "opt->e field copies; ds4_ssd_memory_lock_acquire; ds4_gpu_set_ssd_streaming + ds4_gpu_set_streaming_expert_cache_budget (minimal subset adopted; 25737-25839 span path DEFERRED)"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_cli.c",
+     "region": "1479-1507",
+     "symbols": "--ssd-streaming, --ssd-streaming-cold, --ssd-streaming-cache-experts, --ssd-streaming-preload-experts, --simulate-used-memory parse (copied with fork-style fprintf/exit)"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_help.c",
+     "region": "165-169",
+     "symbols": "help text reworded into the fork's inline usage string in ds4_cli.c"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_ssd.c",
+     "region": "1-182 (whole file)",
+     "symbols": "ds4_parse_gib_arg, ds4_parse_streaming_cache_experts_arg, ds4_ssd_memory_lock_acquire/release, ds4_ssd_cache_*; VERBATIM COPY to fork + add ds4_ssd.o to Makefile (SPEC step 6, dependency of my edits)"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_ssd.h",
+     "region": "1-37 (whole file)",
+     "symbols": "ds4_ssd_memory_lock, ds4_ssd_cache_plan, parse + lock + cache prototypes; VERBATIM COPY; included from fork ds4.h"
+    },
+    {
+     "file": "/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_metal.m",
+     "region": "2775-2807 and 7008-7023, 7128-7140",
+     "symbols": "real Metal impls of the 6 streaming APIs — reference only; fork uses DISABLED no-op stubs since fork Metal lacks the streaming globals (g_ssd_streaming_mode, g_stream_expert_cache, DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES)"
+    }
+   ],
+   "graph_capture_handling": "Not in scope for engine-wiring/Metal-stubs. The CUDA-graph-capture vs begin_compact_load conflict (SPEC risk #2) lives entirely in ds4_cuda.cu routed_moe_launch; ds4.c only flips the ssd_streaming flag at init. No graph-capture code touched by my edits.",
+   "per_device_adaptation": "My ds4.c calls ds4_gpu_set_ssd_streaming + ds4_gpu_set_streaming_expert_cache_budget ONCE at engine init (default device 0). The fork already establishes a per-PP-device loop pattern for the weight cache (ds4.c:19608-19651, ds4_gpu_pp_set_device(g)). For correct multi-GPU streaming the per-device array-ization of g_stream_expert_cache/g_ssd_streaming_mode happens inside ds4_cuda.cu (CUDA component, SPEC risk #1). RECOMMENDED COORDINATION: either (a) the CUDA setter internally fans the budget/mode to all DS4_CUDA_MAX_DEVICES, OR (b) ds4.c should wrap the two setter calls in a `for g in PP devices { ds4_gpu_pp_set_device(g); ...setters... }` loop mirroring the weight-cache loop. I left it as a single init-time call and flagged it; the Metal stubs are inherently single-device (no-op) so unaffected."
+  },
+  {
+   "component": "files + build (ds4_ssd.c / ds4_ssd.h / ds4_streaming_hotlist.inc + Makefile)",
+   "summary": "(a) FILE STATUS: None of the three files exist in the FORK (/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4): `ls` of ds4_ssd.c, ds4_ssd.h, ds4_streaming_hotlist.inc all return \"No such file or directory\". All three exist in UPSTREAM and are VERBATIM-COPYABLE (no fork-specific surgery needed):\n  - /run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_ssd.c  — 6000 bytes, 181 lines. Pure C.\n  - /run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_ssd.h  — 1215 bytes, 36 lines. Pure C.\n  - /run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_streaming_hotlist.inc — 192470 bytes, 13334 lines. Plain static-data .inc (two `static const uint16_t [][2]` tables: ds4_default_streaming_hotlist_pro + ds4_default_streaming_hotlist_flash, plus their _count consts), no #include/#import, no coupling. Included by ds4.c at upstream line 829 (the ds4.c wiring is a DIFFERENT component's job).\n\n(c) PURITY CONFIRMED: `grep -niE 'cuda|metal|__APPLE__|ds4_gpu|<objc|#import|cublas|nvcc'` over ds4_ssd.c+ds4_ssd.h = ZERO hits. ds4_ssd.c includes only ctype/errno/inttypes/stdio/stdlib/string + POSIX <sys/mman.h>,<unistd.h>; ds4_ssd.h includes only <stdbool.h>,<stdint.h>. Uses mmap/mlock/munlock/munmap/sysconf (all POSIX, available on macOS too) and a portable `#ifndef MAP_ANONYMOUS #define MAP_ANONYMOUS MAP_ANON` shim — so it compiles identically in CUDA, cpu (-DDS4_NO_GPU), and Metal/Darwin builds. NO GNU-only deps (no posix_fadvise/madvise/O_DIRECT/_GNU_SOURCE — grep = 0), so it builds clean under the fork's `-std=c99`. SIZE_MAX/UINT64_MAX/UINT32_MAX come from <stdint.h> via the header. => ds4_ssd.o is a plain C object, NOT a GPU file: it needs NO Metal stub and NO #ifndef __APPLE__ guard (the Metal-safety rule applies only to ds4_gpu_* symbols; ds4_ssd_* are pure host C linked into every build).\n\n(b) MAKEFILE: The FORK Makefile (/run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4/Makefile) does NOT list ds4_ssd.o in CORE_OBJS or CPU_CORE_OBJS and has NO ds4_ssd.o compile rule (grep 'ds4_ssd' = empty; grep 'hotlist' = empty). NOTE the fork diverges from upstream: fork CORE_OBJS has NO ds4_distributed.o (upstream does) — so DO NOT copy upstream's OBJS lines wholesale; only ADD ds4_ssd.o. There is NO ROCm section in the fork (grep 'rocm|ROCM' Makefile = empty), so upstream's rocm CORE_OBJS line (its 109) has NO analog to edit — skip it. Exact edits are in fork_edits below. The hotlist .inc needs NO Makefile entry (it is #include'd into ds4.c, not separately compiled) — but ds4.o/ds4_cpu.o prereq lists should gain ds4_ssd.h and ds4_streaming_hotlist.inc for correct incremental rebuilds (optional-but-recommended; included as edits).",
+   "fork_edits": [
+    {
+     "file": "ds4_ssd.c",
+     "anchor": "(new file)",
+     "action": "new_file",
+     "content": "VERBATIM copy of /run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_ssd.c (181 lines, 6000 bytes). No edits. Pure C, compiles in all 3 builds."
+    },
+    {
+     "file": "ds4_ssd.h",
+     "anchor": "(new file)",
+     "action": "new_file",
+     "content": "VERBATIM copy of /run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_ssd.h (36 lines, 1215 bytes). No edits."
+    },
+    {
+     "file": "ds4_streaming_hotlist.inc",
+     "anchor": "(new file)",
+     "action": "new_file",
+     "content": "VERBATIM copy of /run/media/tonoken3/DATA2/Lna-Lab/DwarfStar4-upstream/ds4_streaming_hotlist.inc (13334 lines, 192470 bytes). No edits. Static-data only; #include'd by ds4.c (the ds4.c #include + hotlist seeding is a separate component's job)."
+    },
+    {
+     "file": "Makefile",
+     "anchor": "CORE_OBJS = ds4.o ds4_metal.o",
+     "action": "replace",
+     "content": "CORE_OBJS = ds4.o ds4_ssd.o ds4_metal.o"
+    },
+    {
+     "file": "Makefile",
+     "anchor": "CPU_CORE_OBJS = ds4_cpu.o\nelse",
+     "action": "replace",
+     "content": "CPU_CORE_OBJS = ds4_cpu.o ds4_ssd.o\nelse"
+    },
+    {
+     "file": "Makefile",
+     "anchor": "CORE_OBJS = ds4.o ds4_cuda.o",
+     "action": "replace",
+     "content": "CORE_OBJS = ds4.o ds4_ssd.o ds4_cuda.o"
+    },
+    {
+     "file": "Makefile",
+     "anchor": "CPU_CORE_OBJS = ds4_cpu.o\nMETAL_LDLIBS := $(LDLIBS)",
+     "action": "replace",
+     "content": "CPU_CORE_OBJS = ds4_cpu.o ds4_ssd.o\nMETAL_LDLIBS := $(LDLIBS)"
+    },
+    {
+     "file": "Makefile",
+     "anchor": "ds4_cli.o: ds4_cli.c ds4.h linenoise.h\n\t$(CC) $(CFLAGS) -c -o $@ ds4_cli.c",
+     "action": "insert_before",
+     "content": "ds4_ssd.o: ds4_ssd.c ds4_ssd.h\n\t$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c\n\n"
+    },
+    {
+     "file": "Makefile",
+     "anchor": "ds4.o: ds4.c ds4.h ds4_gpu.h",
+     "action": "replace",
+     "content": "ds4.o: ds4.c ds4.h ds4_gpu.h ds4_ssd.h ds4_streaming_hotlist.inc"
+    },
+    {
+     "file": "Makefile",
+     "anchor": "ds4_cpu.o: ds4.c ds4.h ds4_gpu.h",
+     "action": "replace",
+     "content": "ds4_cpu.o: ds4.c ds4.h ds4_gpu.h ds4_ssd.h ds4_streaming_hotlist.inc"
+    }
+   ],
+   "new_gpu_apis_called_from_shared_ds4c": [],
+   "metal_stub_draft": "NONE REQUIRED. ds4_ssd.c declares no ds4_gpu_* symbols and has zero CUDA/Metal coupling — it is plain host C compiled into ds4_ssd.o and linked into every build (CUDA, cpu, Metal). The Metal-safety rule targets only NEW ds4_gpu_* functions declared in ds4_gpu.h and called from ds4.c; ds4_ssd_* (ds4_parse_gib_arg, ds4_parse_streaming_cache_experts_arg, ds4_ssd_cache_experts_for_byte_budget, ds4_ssd_auto_cache_plan, ds4_ssd_memory_lock_acquire/release) are POSIX host functions defined in ds4_ssd.c itself, so they resolve at link time on every platform with no stub and no #ifndef __APPLE__ guard.",
+   "graph_capture_handling": "Not applicable to this component — files+build only. ds4_ssd.c contains no decode-path / no CUDA-graph code (it is parse helpers + a POSIX mmap/mlock memory-pressure simulator). Graph-capture coexistence is the ds4_cuda.cu / routed_moe_launch component's concern.",
+   "per_device_adaptation": "Not applicable to this component. ds4_ssd.c holds NO per-device state — the only mutable struct is ds4_ssd_memory_lock (a single host anonymous-mmap region, lives in the engine struct, device-agnostic). The single-device-global -> per-device[DS4_CUDA_MAX_DEVICES] array work (g_stream_expert_cache / g_stream_selected_cache / g_ssd_streaming_mode) lives entirely in ds4_cuda.cu and is a separate component's responsibility.",
+   "upstream_sources": [
+    {
+     "file": "ds4_ssd.c",
+     "region": "1-181 (whole file)",
+     "symbols": "ds4_parse_gib_arg, ds4_parse_streaming_cache_experts_arg, ds4_ssd_cache_experts_for_byte_budget, ds4_ssd_auto_cache_plan, ds4_ssd_memory_lock_acquire, ds4_ssd_memory_lock_release",
+     "purpose": "Verbatim-copy into fork: CLI arg parsing (NGB / N-experts), GPU-LRU byte-budget->expert-count math, auto cache plan (80% model_target heuristic), and --simulate-used-memory anonymous-mmap+mlock pressure tool. Pure POSIX C."
+    },
+    {
+     "file": "ds4_ssd.h",
+     "region": "1-36 (whole file)",
+     "symbols": "ds4_ssd_memory_lock (struct), ds4_ssd_cache_plan (struct), all 6 prototypes above",
+     "purpose": "Verbatim-copy header. stdbool/stdint only."
+    },
+    {
+     "file": "ds4_streaming_hotlist.inc",
+     "region": "1-13334 (whole file)",
+     "symbols": "ds4_default_streaming_hotlist_pro[][2], ds4_default_streaming_hotlist_pro_count, ds4_default_streaming_hotlist_flash[][2], ds4_default_streaming_hotlist_flash_count",
+     "purpose": "Verbatim-copy static {layer,expert} popularity tables for LRU seeding. Pure data; #include'd by ds4.c at upstream line 829 (consumed at upstream ds4.c:13966-13970)."
+    },
+    {
+     "file": "Makefile",
+     "region": "upstream 20-21,31-32 and 145-146",
+     "symbols": "CORE_OBJS/CPU_CORE_OBJS, ds4_ssd.o rule",
+     "purpose": "Reference for how upstream wires ds4_ssd.o into both Metal and CUDA CORE_OBJS/CPU_CORE_OBJS and its compile rule. DO NOT copy upstream OBJS lines wholesale (upstream also carries ds4_distributed.o which the fork lacks) — only graft the ds4_ssd.o token and the compile rule, per fork_edits."
+    }
+   ],
+   "risks": [
+    "Fork Makefile OBJS lines differ from upstream (no ds4_distributed.o in fork). Apply ONLY the ds4_ssd.o additions in fork_edits; do not paste upstream's CORE_OBJS lines verbatim or you'll add a nonexistent ds4_distributed.o and break the link.",
+    "Two CPU_CORE_OBJS anchors and two CORE_OBJS anchors exist (Darwin block ~19-20, Linux block ~32-33). The fork_edits disambiguate via trailing context lines ('else' after Darwin CPU_CORE_OBJS; 'METAL_LDLIBS := $(LDLIBS)' after Linux CPU_CORE_OBJS). Verify both got applied; line numbers may drift.",
+    "ds4.c #include of ds4_streaming_hotlist.inc and ds4_ssd.h, plus all ds4_ssd_*/hotlist call sites, are a SEPARATE component's job. After this component, ds4_ssd.o links fine standalone, but `make` will fail to LINK until ds4.c actually references the symbols (or unused-symbol warnings only) — coordinate ordering so the ds4.c-wiring component lands together, else partial builds appear broken.",
+    "The fork has NO ROCm build path (no rocm in Makefile). If a ROCm target is added later it must also gain ds4_ssd.o in its CORE_OBJS — not needed now.",
+    "ds4_streaming_hotlist.inc tables are Pro/Flash-specific {layer,expert} ids generated for upstream's model; verify the fork's DeepSeek-V4-Pro IQ2 1.6T layer/expert dimensions match (61 layers x 384 experts per the SPEC) so seeded ids are in-range — out-of-range ids would only mis-seed the LRU (perf, not correctness), but worth a bounds check in the consuming component."
+   ]
+  }
+ ],
+ "verdict": {
+  "overall": "needs-work",
+  "missing_symbols": [
+   "NONE that break the LINK: every symbol ds4.c/ds4_cli.c/routed_moe_launch references after assembly is defined or stubbed. The only two stream APIs ds4.c actually calls per engine-wiring (ds4_gpu_set_ssd_streaming, ds4_gpu_set_streaming_expert_cache_budget) are defined in public-api/routed-moe (CUDA) and no-op-stubbed in ds4_metal.m. set_model_fd_for_map defined in public-api, Metal-stubbed. All cuda_stream_* helpers + ds4_gpu_stream_expert_table struct defined in streaming-core/public-api. ds4_ssd_* defined in ds4_ssd.c.",
+   "PHANTOM ds4.c CALL SITES: public-api lists ~13 ds4.c call sites (3399/11624/11719/14065/14245/14308/14502/15862/19594/19738/19780/19790/19859/20340/20979/25401) for begin_selected_load/seed_selected/seed_experts/reset_route_hotness/release_resident/current_count/recommended_working_set_size/budget_for_expert_size. VERIFIED grep=0 in FORK ds4.c/ds4_server.c/ds4_bench.c. Those are UPSTREAM line numbers; the fork has NONE of these calls and NO component adds them. Link is fine (defined-but-unreferenced) but the features they drive are UNWIRED.",
+   "g_routed_moe_cur_layer: declared+READ by routed-moe-reconcile but NEVER ASSIGNED by any component (ds4_gpu_routed_moe_one_tensor/batch_tensor FORK 13311/13320 do not set it). table.layer stays 0 -> per-layer LRU collision (SEAM 3 self-flagged blocker, no fix edit provided)."
+  ],
+  "gaps": [
+   "GRAPH-CAPTURE GATING NOT IN ANY fork_edits: routed-moe-reconcile's preferred fix (gate ds4_gpu_decode_subgraph_capture ~FORK263 / pp_chunk_graph_capture_begin ~FORK304 / ds4_gpu_decode_graph_can_capture ~FORK443 with !g_ssd_streaming_mode) is prose-only. The routed_moe_launch edits add a capture-active streaming fallback that points at g_stream_selected_cache[dev] buffers but nothing guarantees host LRU fill ran before replay -> a captured streamed layer replays STALE experts -> silent wrong logits. Must add the can_capture gating edit.",
+   "PER-DEVICE SEED/BUDGET LOOP MISSING: engine-wiring calls set_ssd_streaming + set_streaming_expert_cache_budget ONCE at init on device 0 (self-flagged). Setter bodies write only the current device's [dev] slot, so devices 1-6 get budget 0 / unseeded -> cold-stream every token. No component provides the for(g in PP devices){ds4_gpu_pp_set_device(g); setters;} loop. Multi-GPU functional gap.",
+   "HOTLIST SEED UNWIRED: ds4_streaming_hotlist.inc is copied (files+build) but deliberately NOT #included in ds4.c, and no component #includes it in ds4_cuda.cu nor calls ds4_gpu_stream_expert_cache_seed_experts. The .inc is dead data and the LRU is never warm-seeded. Also unverified: its {layer,expert} ids vs the fork's 61x384 dims (out-of-range only mis-seeds, perf not correctness).",
+   "BYTE-BUDGET (NGB) FORM OF --ssd-streaming-cache-experts IS A NO-OP: engine-wiring sets ssd_streaming_cache_bytes from the GB form but the byte->expert-count conversion (ds4_streaming_cache_experts_for_byte_budget / ds4_streaming_routed_expert_bytes) and ds4_gpu_set_streaming_expert_cache_expert_bytes are never called (helpers don't exist in fork). Only the integer-count form or the DS4_CUDA_STREAMING_EXPERT_CACHE_N env actually sizes the cache. Span-restricted ds4_gpu_set_model_map_spans path is likewise deferred.",
+   "cuda_model_copy_to_device_streamed staging-event model vs fork's cuda_model_stage_read (SPEC risk #5) is UNVERIFIED — if diverged, streamed H2D can race a stale staging buffer -> intermittent wrong weights. Diff before grafting.",
+   "O_DIRECT vs page-cache: config landmine (not code) — DS4_CUDA_NO_DIRECT_IO=1 + DS4_CUDA_KEEP_MODEL_PAGES=1 must both be set or every LRU miss hits Optane and streaming looks broken/slow. No code enforces it; put in run recipe."
+  ],
+  "recommended_apply_order": [
+   "1. files+build: verbatim ds4_ssd.c/.h + ds4_streaming_hotlist.inc; Makefile add ds4_ssd.o to CUDA(line32-33) AND Metal(line19-20) CORE_OBJS/CPU_CORE_OBJS + ds4_ssd.o compile rule + ds4.o/ds4_cpu.o prereq deps. Pure POSIX C, no stub. Apply WITH step 4 (link only resolves once ds4.c uses the symbols).",
+   "2. public-api header+Metal stubs FIRST for link surface: ds4_gpu.h decls (set_model_fd_for_map after line44; stream API block + ds4_gpu_stream_expert_table struct after ds4_gpu_set_quality line49; keep prepare_selected_batch inside existing #if !__APPLE__ guard). Add ALL Metal no-op stubs in ds4_metal.m after ds4_gpu_set_model_fd (line4915). Keeps Metal build green before any caller exists.",
+   "3. streaming-core engine into ds4_cuda.cu: structs (UP132-185) above g_moe_compact_* (~FORK630); globals AS PER-DEVICE ARRAYS [DS4_CUDA_MAX_DEVICES] except g_ssd_streaming_mode + budget_override scalar; helper band (UP1411-2150) + cuda_model_copy_to_device_streamed (UP2152-2247) with explicit int dev threaded; public extern C API (UP2757-3345) reconciling set_model_fd into _for_map (fork body 3085-3119 is byte-identical, confirmed). Replace upstream memset(&g_stream_expert_cache,0) with explicit field reset (vector in array elem). Add per-device teardown into existing for(cd<MAX_DEVICES) free loop (FORK~2784) with cudaSetDevice(cd) before cudaFree.",
+   "4. engine-wiring (ds4.h struct+ds4_ssd.h include, ds4.c backend-supports/struct/open/close, ds4_cli.c parse+help). All anchors verified present in fork (set_quality/power/engine_close/instance_lock/internal struct tail). Introduces the ds4.c->ds4_gpu_* calls satisfied by step 2 stubs.",
+   "5. routed-moe-reconcile LAST: the 4 routed_moe_launch edits (anchors verified byte-exact). THEN add the two REQUIRED missing edits or it produces silent garbage: (a) assign g_routed_moe_cur_layer from a real layer id (SEAM 3 — thread param or set from batch entry layer_index FORK13321); (b) gate ds4_gpu_decode_graph_can_capture FORK443 (+ subgraph/pp_chunk capture) with !g_ssd_streaming_mode so streamed layers skip capture. Also recommended: wire the per-device budget/seed loop (step 4 follow-up) and the hotlist #include+seed_experts call (step 3 follow-up) to make streaming actually warm and multi-GPU."
+  ],
+  "graph_capture_ok": false,
+  "link_surface_ok": true,
+  "per_device_consistent": false,
+  "metal_safety": [
+   {
+    "api": "ds4_gpu_set_ssd_streaming",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_set_streaming_expert_cache_budget",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_set_streaming_expert_cache_expert_bytes",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_recommended_working_set_size",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_set_model_fd_for_map",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_set_model_map_spans",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_stream_expert_cache_configured_count",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_stream_expert_cache_current_count",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_stream_expert_cache_reset_route_hotness",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_stream_expert_cache_release_resident",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_stream_expert_cache_budget_for_expert_size",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_stream_expert_cache_seed_selected",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_stream_expert_cache_begin_selected_load",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_stream_expert_cache_seed_experts",
+    "has_stub_or_guard": true
+   },
+   {
+    "api": "ds4_gpu_stream_expert_cache_prepare_selected_batch",
+    "has_stub_or_guard": true
+   }
+  ]
+ }
+}
