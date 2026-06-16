@@ -2615,7 +2615,22 @@ static int cuda_model_copy_to_device_streamed(
         return 0;
     }
     if (bytes == 0) return 1;
+    /* DEFAULT: copy the expert directly from the (page-cache-resident) model
+     * mmap. With DS4_CUDA_KEEP_MODEL_PAGES=1 the whole GGUF lives in the 1024GB
+     * host RAM page cache, so this reads expert bytes from RAM at full PCIe
+     * speed and is byte-identical to the proven compact path. The streaming win
+     * (only the routed experts land in VRAM, not all 256/layer) is fully
+     * realized here without any pread.
+     *
+     * The pread/staging path below is for TRUE out-of-core streaming (model >
+     * host RAM); it is opt-in via DS4_CUDA_STREAM_USE_PREAD because it currently
+     * reads the wrong bytes for this fork's GGUF mmap layout (the proven-correct
+     * mmap copy above produces coherent output; the pread path produces garbage)
+     * — TODO root-cause the file-offset/fd mismatch before relying on it. For
+     * the Pro 1.6T target (432GB < 1024GB RAM) the model is always resident, so
+     * the mmap path is both correct and optimal. */
     if (g_model_fd < 0 ||
+        getenv("DS4_CUDA_STREAM_USE_PREAD") == NULL ||
         (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base)) {
         return cuda_ok(cudaMemcpy(dst,
                                   (const char *)model_map + offset,
