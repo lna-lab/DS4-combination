@@ -16,8 +16,8 @@ METAL_SRCS := $(wildcard metal/*.metal)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_ssd.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_ssd.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -29,8 +29,8 @@ endif
 NCCL_HOME ?= /home/tonoken3/.local/lib/python3.14/site-packages/nvidia/nccl
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread -I$(NCCL_HOME)/include
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -L$(NCCL_HOME)/lib -lnccl -Xlinker -rpath -Xlinker $(NCCL_HOME)/lib
-CORE_OBJS = ds4.o ds4_cuda.o
-CPU_CORE_OBJS = ds4_cpu.o
+CORE_OBJS = ds4.o ds4_ssd.o ds4_cuda.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_ssd.o
 METAL_LDLIBS := $(LDLIBS)
 endif
 
@@ -128,8 +128,11 @@ cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 endif
 
-ds4.o: ds4.c ds4.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_gpu.h ds4_ssd.h ds4_streaming_hotlist.inc
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
+
+ds4_ssd.o: ds4_ssd.c ds4_ssd.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
 
 ds4_cli.o: ds4_cli.c ds4.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -164,7 +167,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_gpu.h ds4_ssd.h ds4_streaming_hotlist.inc
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h linenoise.h
