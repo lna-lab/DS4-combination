@@ -1,4 +1,5 @@
 #include "ds4.h"
+#include "ds4_ssd.h"
 #include "linenoise.h"
 
 /* ds4 CLI.
@@ -112,6 +113,16 @@ static void usage(FILE *fp) {
         "      CPU helper threads for host-side or reference work.\n"
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
+        "  --ssd-streaming\n"
+        "      CUDA/Metal: opt in to SSD-backed expert streaming instead of full residency.\n"
+        "  --ssd-streaming-cold\n"
+        "      SSD streaming: skip default popularity-based expert-cache preload.\n"
+        "  --ssd-streaming-cache-experts N|NGB\n"
+        "      SSD streaming: per-GPU routed expert LRU as expert count or GiB (e.g. 12GB).\n"
+        "  --ssd-streaming-preload-experts N\n"
+        "      SSD streaming: upfront popularity preload count.\n"
+        "  --simulate-used-memory NGB\n"
+        "      Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.\n"
         "  --dir-steering-file FILE\n"
         "      Load one f32 direction vector per layer for directional steering.\n"
         "  --dir-steering-ffn F\n"
@@ -1677,6 +1688,35 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.prefill_only = true;
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
+        } else if (!strcmp(arg, "--ssd-streaming")) {
+            c.engine.ssd_streaming = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cold")) {
+            c.engine.ssd_streaming_cold = true;
+        } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
+            uint32_t experts = 0;
+            uint64_t bytes = 0;
+            if (!ds4_parse_streaming_cache_experts_arg(
+                    need_arg(&i, argc, argv, arg), &experts, &bytes)) {
+                fprintf(stderr,
+                        "ds4: --ssd-streaming-cache-experts must be a positive count or <number>GB\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_cache_experts = experts;
+            c.engine.ssd_streaming_cache_bytes = bytes;
+        } else if (!strcmp(arg, "--ssd-streaming-preload-experts")) {
+            int v = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (v <= 0) {
+                fprintf(stderr, "ds4: --ssd-streaming-preload-experts must be positive\n");
+                exit(2);
+            }
+            c.engine.ssd_streaming_preload_experts = (uint32_t)v;
+        } else if (!strcmp(arg, "--simulate-used-memory")) {
+            if (!ds4_parse_gib_arg(need_arg(&i, argc, argv, arg),
+                                   &c.engine.simulate_used_memory_bytes)) {
+                fprintf(stderr,
+                        "ds4: --simulate-used-memory must be a positive GiB value, e.g. 64GB\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--power")) {
             c.engine.power_percent = parse_int(need_arg(&i, argc, argv, arg), arg);
             if (c.engine.power_percent < 1 || c.engine.power_percent > 100) {

@@ -4914,6 +4914,57 @@ int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
+/*
+ * SSD expert-streaming is single-device CUDA-only in this fork. Metal builds
+ * are single-device and do not implement the streaming expert cache, so these
+ * are disabled/no-op stubs (METAL-SAFETY RULE: every ds4_gpu_* that the shared
+ * ds4.c can call must have a Metal stub or be #ifndef __APPLE__-guarded).
+ */
+void ds4_gpu_set_ssd_streaming(bool enabled) {
+    if (enabled) {
+        fprintf(stderr,
+                "ds4: SSD expert streaming is not implemented for the Metal backend; "
+                "ignoring --ssd-streaming\n");
+    }
+}
+
+void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
+    (void)experts;
+}
+
+void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
+    (void)bytes;
+}
+
+uint64_t ds4_gpu_recommended_working_set_size(void) {
+    return 0;
+}
+
+int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
+    (void)fd;
+    (void)model_map;
+    return 1;
+}
+
+int ds4_gpu_set_model_map_spans(
+        const void *model_map,
+        uint64_t    model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t    count,
+        uint64_t    max_tensor_bytes) {
+    /*
+     * No multi-span model views on Metal in this fork: map the full model so
+     * non-streaming Metal still works. offsets/sizes describe the streaming
+     * restriction we intentionally ignore here.
+     */
+    (void)offsets;
+    (void)sizes;
+    (void)count;
+    (void)max_tensor_bytes;
+    return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
+}
+
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const void *model_map,
         uint64_t    model_size,

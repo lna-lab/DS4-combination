@@ -86,6 +86,18 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * asks for a reasoning budget the allocated context is not meant to hold. */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
+static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
+    if (backend == DS4_BACKEND_METAL) return true;
+    if (backend == DS4_BACKEND_CUDA) {
+#if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
+        return true;
+#else
+        return false;
+#endif
+    }
+    return false;
+}
+
 static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
 }
@@ -16122,7 +16134,13 @@ struct ds4_engine {
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
     int power_percent;
+    uint32_t ssd_streaming_cache_experts;
+    uint64_t ssd_streaming_cache_bytes;
+    uint32_t ssd_streaming_preload_experts;
+    ds4_ssd_memory_lock simulated_memory;
     bool quality;
+    bool ssd_streaming;
+    bool ssd_streaming_cold;
     bool metal_ready;
     bool mtp_ready;
 };
@@ -19530,6 +19548,11 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     e->mtp_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
+    e->ssd_streaming = opt->ssd_streaming;
+    e->ssd_streaming_cold = opt->ssd_streaming_cold;
+    e->ssd_streaming_cache_experts = opt->ssd_streaming_cache_experts;
+    e->ssd_streaming_cache_bytes = opt->ssd_streaming_cache_bytes;
+    e->ssd_streaming_preload_experts = opt->ssd_streaming_preload_experts;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
     if (e->power_percent > 100) e->power_percent = 100;
     e->mtp_draft_tokens = opt->mtp_draft_tokens > 0 ? opt->mtp_draft_tokens : 1;
@@ -19550,6 +19573,20 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     }
     if (opt->n_threads > 0) g_requested_threads = (uint32_t)opt->n_threads;
     ds4_acquire_instance_lock();
+
+    if (opt->simulate_used_memory_bytes != 0 &&
+        !ds4_ssd_memory_lock_acquire(&e->simulated_memory,
+                                     opt->simulate_used_memory_bytes)) {
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
+    if (e->ssd_streaming && !ds4_backend_supports_ssd_streaming(e->backend)) {
+        fprintf(stderr, "ds4: --ssd-streaming is currently supported only with --metal/--cuda\n");
+        ds4_engine_close(e);
+        *out = NULL;
+        return 1;
+    }
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
@@ -19602,6 +19639,19 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             return 1;
         }
         ds4_gpu_set_quality(e->quality);
+        ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+        /*
+         * NOTE (engine-wiring component): only the count-based GPU-LRU budget
+         * is wired here. The byte-budget -> expert-count conversion and the
+         * --ssd-streaming span-restricted ds4_gpu_set_model_map_spans path
+         * (upstream ds4.c:25643-25839) depend on weights-layer helpers
+         * (weights_model_map_token_spans, ds4_streaming_routed_expert_bytes,
+         * ds4_streaming_cache_experts_for_byte_budget, ...) that DO NOT exist
+         * in this fork. They must be added by the weights-streaming component;
+         * until then ssd_streaming relies on the full ds4_gpu_set_model_map_range
+         * below plus DS4_CUDA_KEEP_MODEL_PAGES=1 for residency.
+         */
+        ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
         (void)ds4_gpu_set_model_fd(e->model.fd);
 
         /* PP weight cache: load all weights for assigned layers to each GPU */
@@ -19780,6 +19830,7 @@ int ds4_engine_model_id(ds4_engine *e) {
 
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
+    ds4_ssd_memory_lock_release(&e->simulated_memory);
     weights_free(&e->weights);
     vocab_free(&e->vocab);
     ds4_threads_shutdown();
