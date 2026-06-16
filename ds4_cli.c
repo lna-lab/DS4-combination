@@ -22,6 +22,7 @@
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 typedef struct {
     const char *prompt;
@@ -47,6 +48,11 @@ typedef struct {
     bool metal_graph_test;
     bool metal_graph_full_test;
     bool metal_graph_prompt_test;
+    /* KV-snapshot bridge (GPU-prefill -> remote-decode handoff). All three are
+     * backend-neutral: they only drive the existing ds4_session_*_payload API. */
+    const char *save_kv_path;   /* --save-kv FILE: write the DSV4 session payload after prefill/load */
+    const char *load_kv_path;   /* --load-kv FILE: restore a DSV4 session payload, then continue decode */
+    bool prefill_only;          /* --prefill-only: stop after prefill (and optional --save-kv), do not generate */
 } cli_generation_options;
 
 typedef struct {
@@ -134,6 +140,14 @@ static void usage(FILE *fp) {
         "      Keep tokens scoring at least F times the top token. Default: 0.05\n"
         "  --seed N\n"
         "      Sampling seed for reproducible non-greedy runs. Default: time-based\n"
+        "  --save-kv FILE\n"
+        "      After prefilling the prompt, write the session KV snapshot (DSV4\n"
+        "      payload) to FILE. Pair with --prefill-only to stop before decoding.\n"
+        "  --load-kv FILE\n"
+        "      Restore a session KV snapshot from FILE and continue decoding from the\n"
+        "      saved next-token distribution. The GPU-prefill -> remote-decode handoff.\n"
+        "  --prefill-only\n"
+        "      Stop after prefill (and optional --save-kv); do not generate tokens.\n"
         "  --think\n"
         "      Use normal thinking mode. This is the default.\n"
         "  --think-max\n"
@@ -900,7 +914,185 @@ static int run_perplexity_file(ds4_engine *engine, const cli_config *cfg) {
     return 0;
 }
 
+/* KV-snapshot bridge: the GPU-prefill -> remote-decode (e.g. Mac/Metal) handoff
+ * primitive. Prefill a prompt (or restore a saved session), optionally write the
+ * session's DSV4 payload to a file, then optionally continue decoding. The saved
+ * file is a backend-portable DSV4 v2 snapshot (checkpoint tokens + next-token
+ * logits + KV) that another node can load and resume from the exact next-token
+ * distribution with no extra decode step. Uses only backend-neutral session API
+ * (no ds4_gpu_* calls), so it compiles and runs on both CUDA and Metal builds. */
+static int run_kv_bridge(ds4_engine *engine, const cli_config *cfg, const ds4_tokens *prompt) {
+    ds4_session *session = NULL;
+    if (ds4_session_create(&session, engine, cfg->gen.ctx_size) != 0) {
+        fprintf(stderr, "ds4: KV bridge requires a session backend\n");
+        return 1;
+    }
+    char err[160];
+
+    if (cfg->gen.load_kv_path) {
+        FILE *fp = fopen(cfg->gen.load_kv_path, "rb");
+        if (!fp) {
+            fprintf(stderr, "ds4: cannot open --load-kv file '%s': %s\n",
+                    cfg->gen.load_kv_path, strerror(errno));
+            ds4_session_free(session);
+            return 1;
+        }
+        struct stat st;
+        if (fstat(fileno(fp), &st) != 0 || st.st_size <= 0) {
+            fprintf(stderr, "ds4: cannot size --load-kv file '%s'\n", cfg->gen.load_kv_path);
+            fclose(fp);
+            ds4_session_free(session);
+            return 1;
+        }
+        const double t0 = cli_now_sec();
+        if (ds4_session_load_payload(session, fp, (uint64_t)st.st_size, err, sizeof(err)) != 0) {
+            fprintf(stderr, "ds4: --load-kv failed: %s\n", err);
+            fclose(fp);
+            ds4_session_free(session);
+            return 1;
+        }
+        fclose(fp);
+        ds4_log(stderr, DS4_LOG_TIMING,
+                "ds4: loaded KV snapshot %s (%.2f GB) in %.2fs; resuming at pos %d\n",
+                cfg->gen.load_kv_path, (double)st.st_size / 1e9,
+                cli_now_sec() - t0, ds4_session_pos(session));
+    } else {
+        cli_prefill_progress progress = {
+            .base_tokens = 0,
+            .input_tokens = prompt->len,
+            .use_color = ds4_log_is_tty(stderr),
+        };
+        const double t0 = cli_now_sec();
+        ds4_session_set_progress(session, cli_prefill_progress_cb, &progress);
+        ds4_session_set_display_progress(session,
+                                         progress.use_color ? cli_prefill_progress_cb : NULL,
+                                         progress.use_color ? &progress : NULL);
+        if (ds4_session_sync(session, prompt, err, sizeof(err)) != 0) {
+            ds4_session_set_progress(session, NULL, NULL);
+            ds4_session_set_display_progress(session, NULL, NULL);
+            fprintf(stderr, "ds4: prompt processing failed: %s\n", err);
+            ds4_session_free(session);
+            return 1;
+        }
+        ds4_session_set_progress(session, NULL, NULL);
+        ds4_session_set_display_progress(session, NULL, NULL);
+        ds4_log(stderr, DS4_LOG_TIMING,
+                "ds4: prefilled %d tokens in %.2fs (pos %d)\n",
+                prompt->len, cli_now_sec() - t0, ds4_session_pos(session));
+    }
+
+    if (cfg->gen.save_kv_path) {
+        FILE *fp = fopen(cfg->gen.save_kv_path, "wb");
+        if (!fp) {
+            fprintf(stderr, "ds4: cannot open --save-kv file '%s': %s\n",
+                    cfg->gen.save_kv_path, strerror(errno));
+            ds4_session_free(session);
+            return 1;
+        }
+        const double t0 = cli_now_sec();
+        int srv = ds4_session_save_payload(session, fp, err, sizeof(err));
+        long sz = 0;
+        if (srv == 0) { fflush(fp); sz = ftell(fp); }
+        if (fclose(fp) != 0 && srv == 0) {
+            fprintf(stderr, "ds4: failed to finalize --save-kv file '%s'\n", cfg->gen.save_kv_path);
+            ds4_session_free(session);
+            return 1;
+        }
+        if (srv != 0) {
+            fprintf(stderr, "ds4: --save-kv failed: %s\n", err);
+            ds4_session_free(session);
+            return 1;
+        }
+        ds4_log(stderr, DS4_LOG_TIMING,
+                "ds4: saved KV snapshot -> %s (%.2f GB) in %.2fs at pos %d\n",
+                cfg->gen.save_kv_path, (double)sz / 1e9,
+                cli_now_sec() - t0, ds4_session_pos(session));
+    }
+
+    if (cfg->gen.prefill_only) {
+        ds4_session_free(session);
+        return 0;
+    }
+
+    /* Continue decoding from the prefilled/restored state. Mirrors the loop in
+     * run_sampled_generation so behaviour is identical to a normal one-shot run. */
+    ds4_think_mode think_mode = cli_effective_think_mode(&cfg->gen);
+    token_printer printer = {
+        .engine = engine,
+        .fp = stdout,
+        .format_thinking = ds4_think_mode_enabled(think_mode),
+        .in_think = ds4_think_mode_enabled(think_mode),
+        .use_color = isatty(fileno(stdout)) != 0,
+        .last_output_newline = true,
+    };
+
+    int max_tokens = cfg->gen.n_predict;
+    int room = ds4_session_ctx(session) - ds4_session_pos(session);
+    if (room <= 1) max_tokens = 0;
+    else if (max_tokens > room - 1) max_tokens = room - 1;
+
+    uint64_t rng = cfg->gen.seed ? cfg->gen.seed :
+        ((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)clock());
+    int generated = 0;
+    const double t_decode0 = cli_now_sec();
+    while (generated < max_tokens && !cli_interrupt_requested()) {
+        int token = ds4_session_sample(session, cfg->gen.temperature, 0,
+                                       cfg->gen.top_p, cfg->gen.min_p, &rng);
+        if (token == ds4_token_eos(engine)) break;
+
+        int toks[17];
+        int ntok = 0;
+        if (cfg->gen.temperature <= 0.0f && ds4_engine_mtp_draft_tokens(engine) > 1 &&
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
+            ntok = ds4_session_eval_speculative_argmax(session, token,
+                                                       max_tokens - generated,
+                                                       ds4_token_eos(engine),
+                                                       toks,
+                                                       (int)(sizeof(toks) / sizeof(toks[0])),
+                                                       err, sizeof(err));
+            if (ntok < 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+        } else {
+            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                fprintf(stderr, "ds4: decode failed: %s\n", err);
+                ds4_session_free(session);
+                return 1;
+            }
+            toks[0] = token;
+            ntok = 1;
+        }
+
+        bool stop = false;
+        for (int j = 0; j < ntok; j++) {
+            if (toks[j] == ds4_token_eos(engine)) { stop = true; break; }
+            size_t piece_len = 0;
+            char *piece = ds4_token_text(engine, toks[j], &piece_len);
+            token_printer_write_text(&printer, piece, piece_len);
+            fflush(stdout);
+            free(piece);
+            generated++;
+            if (generated >= max_tokens) break;
+        }
+        if (stop) break;
+    }
+    generation_done(&printer);
+    if (cli_interrupt_requested()) cli_interrupt_clear();
+    const double decode_s = cli_now_sec() - t_decode0;
+    ds4_log(stderr, DS4_LOG_TIMING, "ds4: generation: %.2f t/s\n",
+            decode_s > 0.0 ? (double)generated / decode_s : 0.0);
+
+    ds4_session_free(session);
+    return 0;
+}
+
 static int run_generation(ds4_engine *engine, const cli_config *cfg) {
+    if (cfg->gen.load_kv_path) {
+        /* Resume from a saved snapshot; no prompt is prefilled in this mode. */
+        return run_kv_bridge(engine, cfg, NULL);
+    }
     ds4_tokens prompt = {0};
     build_prompt(engine, &cfg->gen, &prompt);
 
@@ -927,6 +1119,14 @@ static int run_generation(ds4_engine *engine, const cli_config *cfg) {
     }
     if (cfg->gen.dump_logprobs_path) {
         rc = run_logprob_dump(engine, cfg, &prompt);
+        ds4_tokens_free(&prompt);
+        return rc;
+    }
+
+    if (cfg->gen.save_kv_path) {
+        /* Prefill the prompt, write the KV snapshot, then (unless --prefill-only)
+         * keep decoding. The load side is handled at the top of this function. */
+        rc = run_kv_bridge(engine, cfg, &prompt);
         ds4_tokens_free(&prompt);
         return rc;
     }
@@ -1469,6 +1669,12 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--save-kv")) {
+            c.gen.save_kv_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--load-kv")) {
+            c.gen.load_kv_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--prefill-only")) {
+            c.gen.prefill_only = true;
         } else if (!strcmp(arg, "--quality")) {
             c.engine.quality = true;
         } else if (!strcmp(arg, "--power")) {
@@ -1605,9 +1811,10 @@ int main(int argc, char **argv) {
                                         cfg.gen.imatrix_max_tokens);
     } else if (cfg.gen.perplexity_file_path) {
         rc = run_perplexity_file(engine, &cfg);
-    } else if (cfg.gen.prompt == NULL) {
+    } else if (cfg.gen.prompt == NULL && cfg.gen.load_kv_path == NULL) {
         rc = run_repl(engine, &cfg);
     } else {
+        /* One-shot: a prompt to prefill, and/or a --load-kv snapshot to resume. */
         rc = run_generation(engine, &cfg);
     }
     ds4_engine_close(engine);
