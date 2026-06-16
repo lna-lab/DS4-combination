@@ -97,6 +97,13 @@ static int g_quality_mode;
 
 #define DS4_CUDA_MAX_DEVICES 16
 
+/* SSD expert-streaming global ON/OFF (Part 2). Declared early so the CUDA-graph
+ * capture gates (ds4_gpu_pp_chunk_graph_capture_begin, decode_graph_can_capture)
+ * can refuse capture in streaming mode — the streaming gather does host-side
+ * LRU work + cudaMemcpy that is illegal during graph capture (SEAM 2). Policy
+ * flag, identical on every GPU, so it stays scalar (not per-device). */
+static int g_ssd_streaming_mode;
+
 /* CUDA Graph decode infrastructure (Phase 0-1) */
 static cudaStream_t g_cuda_decode_stream;
 static int g_cuda_decode_stream_created;
@@ -306,6 +313,9 @@ extern "C" int ds4_gpu_decode_subgraph_launch(int part, int layer) {
 
 extern "C" int ds4_gpu_pp_chunk_graph_capture_begin(int gpu) {
     if (gpu < 0 || gpu >= DS4_CUDA_MAX_DEVICES || !g_pp_stream[gpu]) return 0;
+    /* SEAM 2: refuse PP chunk-graph capture when SSD streaming is active — the
+     * per-layer expert gather runs host-side work illegal under capture. */
+    if (g_ssd_streaming_mode) return 0;
     cudaSetDevice(gpu);
     cudaStream_t stream = ds4_decode_stream();
     if (!stream) {
@@ -444,6 +454,20 @@ extern "C" int ds4_gpu_decode_graph_captured(void) {
 }
 
 extern "C" int ds4_gpu_decode_graph_can_capture(void) {
+    /* SEAM 2: in SSD-streaming mode the per-step expert gather does host-side
+     * LRU bookkeeping + cudaMemcpy that cannot run inside a captured graph and
+     * would not refill the streamed buffer on replay (stale-expert garbage).
+     * Disable decode-graph capture; the streaming copy latency dwarfs the
+     * launch overhead the graph would have hidden. */
+    if (g_ssd_streaming_mode) {
+        if (!g_decode_graph_capture_disabled_notice_printed) {
+            fprintf(stderr,
+                    "ds4: CUDA graph capture disabled: SSD expert streaming is active "
+                    "(experts are gathered on the host each step)\n");
+            g_decode_graph_capture_disabled_notice_printed = 1;
+        }
+        return 0;
+    }
     const int temp_moe_weights =
         cuda_moe_temp_weights_enabled() &&
         !g_model_device_owned &&
@@ -657,8 +681,8 @@ static int g_moe_compact_notice_printed;
  * Exceptions: g_ssd_streaming_mode is a global ON/OFF flag, and
  * g_stream_expert_budget_override is a one-time user setting (CLI) shared by
  * all GPUs — both stay scalar. The four runtime sizing/notice fields are
- * per-device OOM state (each 16GB GPU may shrink its cap independently). */
-static int g_ssd_streaming_mode;
+ * per-device OOM state (each 16GB GPU may shrink its cap independently).
+ * g_ssd_streaming_mode is declared near the top (before the graph-capture gates). */
 static cuda_stream_selected_cache g_stream_selected_cache[DS4_CUDA_MAX_DEVICES];
 static cuda_stream_expert_cache   g_stream_expert_cache[DS4_CUDA_MAX_DEVICES];
 static uint32_t g_stream_expert_budget_override;
@@ -14164,7 +14188,8 @@ static int routed_moe_launch(
         uint32_t n_expert,
         float clamp,
         const ds4_gpu_tensor *x,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        uint32_t layer_index) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -14227,6 +14252,7 @@ static int routed_moe_launch(
     const char *up_w = NULL;
     const char *down_w = NULL;
     int use_compact = 0;
+    int use_stream = 0; /* SSD streaming: weights came from g_stream_selected_cache[dev] */
     /* max n_expert=6, max n_tokens=3 (MTP draft=3), so 18 slots */
     int32_t compact_remap[18];
     uint64_t compact_exp_bytes =
@@ -14299,10 +14325,22 @@ static int routed_moe_launch(
                     capture_active = (st == cudaStreamCaptureStatusActive);
             }
             if (capture_active) {
+                /* SEAM 2: no host work allowed during graph capture. Point at
+                 * buffers a prior non-captured prime pass populated. Streamed
+                 * layers SHOULD have capture disabled (ds4_gpu_decode_graph_can_capture
+                 * returns 0 when g_ssd_streaming_mode); this is the belt-and-
+                 * suspenders fallback if a streamed layer is ever captured. */
                 use_compact = 1;
-                gate_w = g_moe_compact_gate[compact_dev];
-                up_w   = g_moe_compact_up[compact_dev];
-                down_w = g_moe_compact_down[compact_dev];
+                if (g_ssd_streaming_mode && g_stream_selected_cache[compact_dev].valid) {
+                    use_stream = 1;
+                    gate_w = (const char *)g_stream_selected_cache[compact_dev].gate_ptr;
+                    up_w   = (const char *)g_stream_selected_cache[compact_dev].up_ptr;
+                    down_w = (const char *)g_stream_selected_cache[compact_dev].down_ptr;
+                } else {
+                    gate_w = g_moe_compact_gate[compact_dev];
+                    up_w   = g_moe_compact_up[compact_dev];
+                    down_w = g_moe_compact_down[compact_dev];
+                }
             } else {
             /* Read selected indices from device (6 int32 = 24 bytes, fast).
              * With the graph decode stream enabled, router kernels run on a
@@ -14316,7 +14354,36 @@ static int routed_moe_launch(
                 ce = cudaMemcpy(host_selected, selected->ptr,
                                 (size_t)n_expert * n_tokens * 4, cudaMemcpyDeviceToHost);
             }
-            if (ce == cudaSuccess) {
+            if (ce == cudaSuccess && g_ssd_streaming_mode) {
+                /* STREAMING gather: the per-device GPU-LRU g_stream_expert_cache[dev]
+                 * (backed by OS page cache + Optane SSD) replaces the direct
+                 * mmap->H2D loop below. Dedup-packs unique experts into
+                 * g_stream_selected_cache[dev].{gate,up,down}_ptr and writes the
+                 * per-pair slot map into slot_selected_ptr. UPSTREAM entry is
+                 * ds4_gpu_stream_expert_cache_prepare_selected_batch (UP 3176). */
+                ds4_gpu_stream_expert_table table;
+                table.model_map         = model_map;
+                table.model_size        = model_size;
+                table.layer             = layer_index;
+                table.n_total_expert    = n_total_expert;
+                table.gate_offset       = gate_offset;
+                table.up_offset         = up_offset;
+                table.down_offset       = down_offset;
+                table.gate_expert_bytes = gate_expert_bytes;
+                table.down_expert_bytes = down_expert_bytes;
+                if (ds4_gpu_stream_expert_cache_prepare_selected_batch(
+                        &table, host_selected, n_tokens, n_expert) &&
+                    g_stream_selected_cache[compact_dev].valid) {
+                    use_compact = 1;
+                    use_stream  = 1;
+                    gate_w = (const char *)g_stream_selected_cache[compact_dev].gate_ptr;
+                    up_w   = (const char *)g_stream_selected_cache[compact_dev].up_ptr;
+                    down_w = (const char *)g_stream_selected_cache[compact_dev].down_ptr;
+                }
+                /* if prepare failed (returned 0 / !valid), use_stream stays 0 and
+                 * we drop into the existing g_moe_compact_* fill below (safety net). */
+            }
+            if (ce == cudaSuccess && !use_stream) {
                 use_compact = 1;
                 /* Copy each selected expert's weights to compact scratch per token */
                 for (uint32_t ti = 0; ti < n_tokens; ti++) {
@@ -14393,9 +14460,10 @@ static int routed_moe_launch(
     }
 
     int ok = 1;
-    const int32_t *selected_ptr = use_compact
-        ? g_moe_compact_selected_dev[compact_dev]
-        : (const int32_t *)selected->ptr;
+    const int32_t *selected_ptr =
+        use_stream  ? g_stream_selected_cache[compact_dev].slot_selected_ptr :
+        use_compact ? g_moe_compact_selected_dev[compact_dev] :
+                      (const int32_t *)selected->ptr;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
     const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
     const uint64_t xq_count = (uint64_t)n_tokens * xq_blocks;
@@ -14930,10 +14998,13 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, 1);
+                             selected, weights, n_total_expert, n_expert, clamp, x, 1,
+                             0u /* one-tensor path has no layer id; streaming LRU
+                                 * disambiguates layers by per-layer gate/up/down
+                                 * offsets in cuda_stream_expert_cache_find, so a
+                                 * constant layer here is correct (SEAM 3). */);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
-    (void)layer_index;
     if (mid_is_f16) *mid_is_f16 = false;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
@@ -14941,7 +15012,8 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              gate_expert_bytes, gate_row_bytes,
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
-                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens);
+                             selected, weights, n_total_expert, n_expert, clamp, x, n_tokens,
+                             layer_index /* SEAM 3: real layer id for streaming LRU */);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
