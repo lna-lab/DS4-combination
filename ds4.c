@@ -17976,7 +17976,13 @@ struct ds4_session {
  */
 
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(1)
+/* Emit v2 so CUDA-node snapshots load on the upstream Metal binary running on
+ * the decode node. The single-machine DSV4 body is byte-identical across v1/v2;
+ * upstream bumped to v2 only to add a distributed save path we do not use
+ * (verified: the sole save-path diff is the `if (s->distributed)` early return).
+ * The loader below still accepts legacy v1 files written by this fork. */
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
+#define DS4_SESSION_PAYLOAD_VERSION_LEGACY UINT32_C(1)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
 #define DS4_SESSION_IO_CHUNK (8u * 1024u * 1024u)
 
@@ -18646,7 +18652,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     for (uint32_t i = 0; i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++) {
         if (payload_read_u32(fp, &h[i], &remaining, err, errlen) != 0) return 1;
     }
-    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC || h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+    if (h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
+        (h[1] != DS4_SESSION_PAYLOAD_VERSION &&
+         h[1] != DS4_SESSION_PAYLOAD_VERSION_LEGACY)) {
         payload_set_err(err, errlen, "unsupported session payload version");
         return 1;
     }
