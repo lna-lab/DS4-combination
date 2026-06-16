@@ -42,11 +42,64 @@ int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
+int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
+int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint64_t context_bytes);
 void ds4_gpu_set_quality(bool quality);
+
+/* =========================================================================
+ * SSD expert streaming (Part 2 port from upstream antirez/ds4).
+ * Ported for the IQ2 Pro 1.6T target: experts live on Optane SSD, an LRU
+ * GPU cache is backed by the OS page cache (1024GB host RAM).  Metal builds
+ * compile no-op stubs (ds4_metal.m); CUDA builds get the real path.
+ * ========================================================================= */
+void ds4_gpu_set_ssd_streaming(bool enabled);
+void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
+void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+uint64_t ds4_gpu_recommended_working_set_size(void);
+uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
+uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+typedef struct ds4_gpu_stream_expert_table {
+    const void *model_map;
+    uint64_t    model_size;
+    uint32_t    layer;
+    uint32_t    n_total_expert;
+    uint64_t    gate_offset;
+    uint64_t    up_offset;
+    uint64_t    down_offset;
+    uint64_t    gate_expert_bytes;
+    uint64_t    down_expert_bytes;
+} ds4_gpu_stream_expert_table;
+/* Reset only the prompt-local eviction heuristic.  The resident SSD expert
+ * cache itself is intentionally kept warm across sessions. */
+void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
+void ds4_gpu_stream_expert_cache_release_resident(void);
+uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes);
+int ds4_gpu_stream_expert_cache_seed_selected(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected);
+int ds4_gpu_stream_expert_cache_begin_selected_load(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__)
+int ds4_gpu_stream_expert_cache_prepare_selected_batch(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_tokens,
+        uint32_t                           n_selected);
+#endif
+int ds4_gpu_stream_expert_cache_seed_experts(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        const uint32_t                    *expert_priorities,
+        uint32_t                           n_experts);
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================
