@@ -710,6 +710,12 @@ static int g_stream_gpu_gather = -1; /* -1=uninit; 0/1 resolved from env */
 static std::unordered_map<uint64_t, uint32_t> g_stream_gate_off_layerid;
 static int32_t *g_stream_expert_slot_dir[DS4_CUDA_MAX_DEVICES];
 static uint32_t g_stream_dir_experts[DS4_CUDA_MAX_DEVICES];
+/* gather per-device scratch: resolved LRU slot per pair, miss list, miss count.
+ * max pairs = n_tokens(3) * n_expert(6) = 18. */
+static int32_t *g_stream_gather_resolved[DS4_CUDA_MAX_DEVICES];   /* [18] device */
+static int32_t *g_stream_gather_miss_ids[DS4_CUDA_MAX_DEVICES];   /* [18] device */
+static int32_t *g_stream_gather_miss_count[DS4_CUDA_MAX_DEVICES]; /* [1]  device */
+static int32_t *g_stream_gather_miss_host[DS4_CUDA_MAX_DEVICES];  /* [19] pinned host (count+ids) */
 
 /* Pipeline Parallelism (PP) state */
 static int g_pp_ngpu;
@@ -2556,6 +2562,39 @@ static void cuda_stream_dir_update_load(int dev,
     (void)cudaGetLastError();
 }
 
+/* GPU resolve: for each routed pair, look up its expert's LRU slot in the device
+ * directory row for this layer. resolved[i] = slot (or -1 = miss). Misses are
+ * appended (atomically) to miss_ids with miss_count. No host involvement. */
+__global__ static void cuda_stream_gather_resolve_kernel(
+        const int32_t *selected, uint32_t n_pairs, uint32_t n_total_expert,
+        const int32_t *dir_row, int32_t *resolved,
+        int32_t *miss_ids, int32_t *miss_count) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_pairs) return;
+    int e = selected[i];
+    if (e < 0 || (uint32_t)e >= n_total_expert) e = 0;
+    const int s = dir_row[e];
+    resolved[i] = s;
+    if (s < 0) {
+        const int m = atomicAdd(miss_count, 1);
+        if (m < (int)n_pairs) miss_ids[m] = e;
+    }
+}
+
+/* per-device gather scratch: resolved[18] + miss_ids[18] + miss_count[1] on
+ * device, plus a pinned host buffer [19] (count at [0], ids at [1..]). */
+static int cuda_stream_gather_scratch_ensure(int dev) {
+    if (dev < 0 || dev >= DS4_CUDA_MAX_DEVICES) return 0;
+    if (g_stream_gather_resolved[dev]) return 1;
+    if (!cuda_ok(cudaMalloc(&g_stream_gather_resolved[dev], 18 * sizeof(int32_t)), "gather resolved alloc") ||
+        !cuda_ok(cudaMalloc(&g_stream_gather_miss_ids[dev], 18 * sizeof(int32_t)), "gather miss_ids alloc") ||
+        !cuda_ok(cudaMalloc(&g_stream_gather_miss_count[dev], sizeof(int32_t)), "gather miss_count alloc") ||
+        !cuda_ok(cudaMallocHost(&g_stream_gather_miss_host[dev], 19 * sizeof(int32_t)), "gather miss_host alloc")) {
+        return 0;
+    }
+    return 1;
+}
+
 static int cuda_stream_expert_cache_load_slot(
         cuda_stream_expert_cache *cache,
         const void *model_map,
@@ -2707,6 +2746,99 @@ static int cuda_stream_layer_expert_ranges_valid(
                 what ? what : "selected");
         return 0;
     }
+    return 1;
+}
+
+/* GPU-side gather decode path (DS4_STREAM_GPU_GATHER). Resolves each routed
+ * pair's expert to its resident LRU slot ON THE GPU, so the hit path does no
+ * host find/lru scans and no D2D compact copies — only one tiny miss-count
+ * readback + (rare) miss loads. On success sets *out_gate/up/down to the
+ * resident LRU buffers and *out_resolved to a device slot-index array, and the
+ * MoE kernels read the LRU in place. Returns 1 on success, 0 to fall back to
+ * the host gather path (correctness-preserving). */
+static int cuda_stream_gpu_gather_decode(
+        int dev,
+        const void *model_map, uint64_t model_size,
+        uint32_t layer, uint32_t n_total_expert,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes,
+        const int32_t *selected_dev, uint32_t n_pairs,
+        const char **out_gate, const char **out_up, const char **out_down,
+        const int32_t **out_resolved) {
+    if (dev < 0 || dev >= DS4_CUDA_MAX_DEVICES || n_pairs == 0 || n_pairs > 18) return 0;
+    cudaStream_t ds = ds4_decode_stream();
+    if (!ds) return 0;
+
+    cuda_stream_expert_cache *cache =
+        cuda_stream_expert_cache_prepare(gate_expert_bytes, down_expert_bytes, 0);
+    if (!cache || !cache->valid || cache->capacity == 0) return 0;
+    if (!cuda_stream_dir_ensure(dev, n_total_expert)) return 0;
+    if (!cuda_stream_gather_scratch_ensure(dev)) return 0;
+
+    const uint32_t lid = cuda_stream_layerid(gate_offset);
+    int32_t *dir_row = g_stream_expert_slot_dir[dev] +
+                       (size_t)lid * g_stream_dir_experts[dev];
+
+    /* resolve (runs after the router on the decode stream) */
+    (void)cudaMemsetAsync(g_stream_gather_miss_count[dev], 0, sizeof(int32_t), ds);
+    cuda_stream_gather_resolve_kernel<<<1, 32, 0, ds>>>(
+        selected_dev, n_pairs, n_total_expert, dir_row,
+        g_stream_gather_resolved[dev], g_stream_gather_miss_ids[dev],
+        g_stream_gather_miss_count[dev]);
+    if (!cuda_ok(cudaGetLastError(), "gather resolve launch")) return 0;
+    if (!cuda_ok(cudaStreamSynchronize(ds), "gather resolve sync")) return 0;
+
+    int32_t n_miss = 0;
+    if (!cuda_ok(cudaMemcpy(&n_miss, g_stream_gather_miss_count[dev], sizeof(int32_t),
+                            cudaMemcpyDeviceToHost), "gather miss count d2h")) return 0;
+    if (n_miss > 0) {
+        if (n_miss > (int32_t)n_pairs) n_miss = (int32_t)n_pairs;
+        int32_t miss[18];
+        if (!cuda_ok(cudaMemcpy(miss, g_stream_gather_miss_ids[dev],
+                                (size_t)n_miss * sizeof(int32_t),
+                                cudaMemcpyDeviceToHost), "gather miss ids d2h")) return 0;
+        for (int32_t m = 0; m < n_miss; m++) {
+            uint32_t e = (uint32_t)miss[m];
+            if (e >= n_total_expert) continue;
+            uint32_t slot = cuda_stream_expert_cache_lru_slot(cache);
+            int append = !cache->slots[slot].valid;
+            if (!cuda_stream_expert_cache_load_slot(cache, model_map, model_size, slot,
+                    layer, n_total_expert, e, gate_offset, up_offset, down_offset,
+                    gate_expert_bytes, down_expert_bytes)) {
+                return 0;
+            }
+            if (append && cache->count < cache->capacity) cache->count++;
+        }
+        /* re-resolve: the just-loaded experts are now in the directory */
+        (void)cudaMemsetAsync(g_stream_gather_miss_count[dev], 0, sizeof(int32_t), ds);
+        cuda_stream_gather_resolve_kernel<<<1, 32, 0, ds>>>(
+            selected_dev, n_pairs, n_total_expert, dir_row,
+            g_stream_gather_resolved[dev], g_stream_gather_miss_ids[dev],
+            g_stream_gather_miss_count[dev]);
+        if (!cuda_ok(cudaGetLastError(), "gather resolve2 launch")) return 0;
+        if (!cuda_ok(cudaStreamSynchronize(ds), "gather resolve2 sync")) return 0;
+        int32_t n_miss2 = 0;
+        if (!cuda_ok(cudaMemcpy(&n_miss2, g_stream_gather_miss_count[dev], sizeof(int32_t),
+                                cudaMemcpyDeviceToHost), "gather miss2 d2h")) return 0;
+        if (n_miss2 != 0) return 0; /* eviction collision -> host fallback */
+    }
+
+    /* bump LRU ages for the resolved (hit) slots so the eviction policy stays
+     * meaningful (the GPU resolve does not touch host ages). */
+    int32_t res[18];
+    if (!cuda_ok(cudaMemcpy(res, g_stream_gather_resolved[dev],
+                            (size_t)n_pairs * sizeof(int32_t),
+                            cudaMemcpyDeviceToHost), "gather resolved d2h")) return 0;
+    for (uint32_t i = 0; i < n_pairs; i++) {
+        int32_t s = res[i];
+        if (s < 0 || (uint32_t)s >= cache->capacity) return 0; /* must not happen */
+        cache->slots[(uint32_t)s].age = ++cache->tick;
+    }
+
+    *out_gate = cache->gate_ptr;
+    *out_up   = cache->up_ptr;
+    *out_down = cache->down_ptr;
+    *out_resolved = g_stream_gather_resolved[dev];
     return 1;
 }
 
@@ -14380,6 +14512,8 @@ static int routed_moe_launch(
     const char *down_w = NULL;
     int use_compact = 0;
     int use_stream = 0; /* SSD streaming: weights came from g_stream_selected_cache[dev] */
+    int use_gather = 0; /* GPU-side gather: weights read in place from the resident LRU */
+    const int32_t *gather_resolved = NULL; /* device slot-index per pair (gather path) */
     /* max n_expert=6, max n_tokens=3 (MTP draft=3), so 18 slots */
     int32_t compact_remap[18];
     uint64_t compact_exp_bytes =
@@ -14469,6 +14603,27 @@ static int routed_moe_launch(
                     down_w = g_moe_compact_down[compact_dev];
                 }
             } else {
+            /* GPU-side gather fast path (DS4_STREAM_GPU_GATHER): resolve experts
+             * to resident LRU slots on the GPU and read the LRU in place, skipping
+             * the host sync + D2H(selected) + host LRU scans + D2D compact copies. */
+            if (cuda_stream_gpu_gather_enabled() && g_ssd_streaming_mode) {
+                const char *gg = NULL, *gu = NULL, *gd = NULL;
+                const int32_t *gr = NULL;
+                if (cuda_stream_gpu_gather_decode(
+                        compact_dev, model_map, model_size, layer_index, n_total_expert,
+                        gate_offset, up_offset, down_offset,
+                        gate_expert_bytes, down_expert_bytes,
+                        (const int32_t *)selected->ptr, n_expert * n_tokens,
+                        &gg, &gu, &gd, &gr)) {
+                    use_compact = 1;
+                    use_stream  = 1;
+                    use_gather  = 1;
+                    gate_w = gg; up_w = gu; down_w = gd;
+                    gather_resolved = gr;
+                }
+                /* if gather failed, use_gather stays 0 -> host path below */
+            }
+            if (!use_gather) {
             /* Read selected indices from device (6 int32 = 24 bytes, fast).
              * With the graph decode stream enabled, router kernels run on a
              * non-default stream, so synchronize it before this host read. */
@@ -14550,6 +14705,7 @@ static int routed_moe_launch(
             } else {
                 (void)cudaGetLastError();
             }
+            } /* !use_gather (host gather path) */
             } /* !capture_active */
         }
     }
@@ -14588,6 +14744,7 @@ static int routed_moe_launch(
 
     int ok = 1;
     const int32_t *selected_ptr =
+        use_gather  ? gather_resolved :
         use_stream  ? g_stream_selected_cache[compact_dev].slot_selected_ptr :
         use_compact ? g_moe_compact_selected_dev[compact_dev] :
                       (const int32_t *)selected->ptr;
