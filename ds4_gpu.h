@@ -423,6 +423,33 @@ int ds4_gpu_compressor_prefill_state_ratio4_tensor(
         uint32_t                head_dim,
         uint32_t                pos0);
 
+/* Hybrid backend: expert-resident multi-GPU attention decode (CUDA only).
+ * The scratch holds device-side stateful buffers whose concrete layout lives
+ * in the CUDA backend, so the type stays opaque here (used only via pointer).
+ * The Metal build provides stubs in ds4_metal.m that report the hybrid path
+ * requires CUDA. This declaration was dropped from the header during the
+ * upstream merge; the Metal-only object (ds4_metal.o, not built by the CUDA
+ * node) is the only translation unit that needs it, which is why the gap was
+ * invisible to CUDA-side builds. */
+typedef struct ds4_hybrid_scratch ds4_hybrid_scratch;
+
+void ds4_hybrid_scratch_free(ds4_hybrid_scratch *s);
+
+int ds4_gpu_attention_decode_hybrid(
+        ds4_hybrid_scratch      *scratch,
+        float                   *out_heads_cpu,
+        const void              *model_map,
+        uint64_t                 model_size,
+        uint64_t                 sinks_offset,
+        const float             *q_cpu,
+        uint32_t                 n_head,
+        uint32_t                 head_dim,
+        const float             *raw_kv_cpu,
+        uint32_t                 n_raw,
+        const float             *comp_kv_cpu,
+        uint32_t                 n_comp,
+        const bool              *comp_allowed_cpu);
+
 int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

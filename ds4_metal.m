@@ -12083,6 +12083,187 @@ int ds4_gpu_attention_decode_hybrid(
     return 0;
 }
 
+/* =========================================================================
+ * Metal stubs for the CUDA-only multi-GPU GPU API.
+ * =========================================================================
+ *
+ * The shared graph code in ds4.c (generate_metal_graph_raw_swa,
+ * metal_graph_encode_decode_layer, metal_graph_encode_token_raw_swa_pp)
+ * is compiled for every GPU backend and references a Pipeline-Parallel /
+ * Tensor-Parallel / CUDA-Graph API that only the CUDA backend implements.
+ * Metal is single-device with unified memory, so none of these features
+ * apply. Every heavy primitive below sits behind a runtime feature gate in
+ * ds4.c (e.g. `if (ds4_gpu_pp_requested())`, `if (tp > 1)`, the env-gated
+ * `DS4_CUDA_GPU_ARGMAX` path); because the query stubs report the features
+ * as disabled (pp/tp off, degree 1), the work stubs are never reached at
+ * runtime on Metal — they exist solely to satisfy the linker. The default
+ * Metal decode path (CPU argmax, no PP/TP) is therefore unchanged.
+ *
+ * These declarations were added to ds4_gpu.h when the CUDA crown-jewel work
+ * landed, but the Metal backend was never updated to match (the CUDA build
+ * does not compile ds4_metal.o, so the gap was invisible on that node). */
+
+/* --- Feature-state queries: report "single device, no PP/TP/graph". --- */
+int  ds4_gpu_pp_enabled(void)            { return 0; }
+int  ds4_gpu_pp_requested(void)          { return 0; }
+int  ds4_gpu_pp_resident_ready(void)     { return 0; }
+int  ds4_gpu_pp_ngpu(void)               { return 1; }
+int  ds4_gpu_tp_enabled(void)            { return 0; }
+int  ds4_gpu_tp_degree(void)             { return 1; }
+int  ds4_gpu_tp_rank(int g)              { (void)g; return 0; }
+int  ds4_gpu_current_device(void)        { return 0; }
+int  ds4_gpu_decode_graph_can_capture(void) { return 0; }
+int  ds4_gpu_decode_subgraphs_ready(void)   { return 0; }
+int  ds4_gpu_pp_chunk_graph_ready(int gpu)  { (void)gpu; return 0; }
+
+/* --- Model-dim setters: Metal kernels take dims as buffer args, so the
+ *     device-side constants the CUDA backend caches here are not needed. --- */
+void ds4_gpu_set_n_embd(uint32_t n)  { (void)n; }
+void ds4_gpu_set_n_layer(uint32_t n) { (void)n; }
+
+/* --- Persistent MoE expert-weight scratch: a CUDA VRAM-pressure optimization
+ *     (DS4_CUDA_MOE_PERSISTENT_SCRATCH). The Metal MoE path manages its own
+ *     scratch, so this is a no-op. --- */
+void ds4_gpu_init_moe_scratch(uint64_t gate_bytes, uint64_t up_bytes, uint64_t down_bytes) {
+    (void)gate_bytes; (void)up_bytes; (void)down_bytes;
+}
+
+/* --- PP weight-residency / device control (reached only when PP requested). --- */
+void ds4_gpu_release_weight_cache_for_pp(void) {}
+void ds4_gpu_model_range_reserve(void) {}
+int  ds4_gpu_pp_set_device(int g)                 { (void)g; return 0; }
+int  ds4_gpu_pp_enable_decode(void)               { return 0; }
+int  ds4_gpu_pp_layer_start(int g)                { (void)g; return 0; }
+int  ds4_gpu_pp_layer_end(int g)                  { (void)g; return 0; }
+int  ds4_gpu_pp_work_streams_enable(int enable)   { (void)enable; return 0; }
+void ds4_gpu_pp_deactivate_decode_params_all(int ngpu) { (void)ngpu; }
+
+int  ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size,
+                               uint64_t offset, uint64_t bytes, const char *label) {
+    (void)model_map; (void)model_size; (void)offset; (void)bytes; (void)label; return 0;
+}
+int  ds4_gpu_cache_model_range_force(const void *model_map, uint64_t model_size,
+                                     uint64_t offset, uint64_t bytes, const char *label) {
+    (void)model_map; (void)model_size; (void)offset; (void)bytes; (void)label; return 0;
+}
+int  ds4_gpu_cache_col_shard(const void *model_map, uint64_t model_size,
+                             uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+                             int rank, int k, const char *label) {
+    (void)model_map; (void)model_size; (void)offset; (void)in_dim; (void)out_dim;
+    (void)rank; (void)k; (void)label; return 0;
+}
+int  ds4_gpu_cache_row_shard(const void *model_map, uint64_t model_size,
+                             uint64_t offset, uint64_t in_dim, uint64_t out_dim,
+                             int rank, int k, const char *label) {
+    (void)model_map; (void)model_size; (void)offset; (void)in_dim; (void)out_dim;
+    (void)rank; (void)k; (void)label; return 0;
+}
+
+/* --- P2P transfer (reached only in multi-GPU PP decode). --- */
+int  ds4_gpu_pp_p2p_copy_ordered_async(int dst_gpu, int src_gpu,
+                                       void *dst_ptr, void *src_ptr, uint64_t bytes) {
+    (void)dst_gpu; (void)src_gpu; (void)dst_ptr; (void)src_ptr; (void)bytes; return 0;
+}
+int  ds4_gpu_pp_p2p_copy_ptr(int dst_gpu, int src_gpu,
+                             void *dst_ptr, void *src_ptr, uint64_t bytes) {
+    (void)dst_gpu; (void)src_gpu; (void)dst_ptr; (void)src_ptr; (void)bytes; return 0;
+}
+void *ds4_gpu_tensor_device_ptr(ds4_gpu_tensor *tensor) { (void)tensor; return NULL; }
+
+/* --- CUDA Graph capture/replay (env DS4_CUDA_DECODE_GRAPH; capture reported
+ *     unavailable above, so these never run on Metal). --- */
+int  ds4_gpu_decode_graph_capture(void)                  { return 0; }
+int  ds4_gpu_decode_graph_capture_end_store(int part, int layer) { (void)part; (void)layer; return 0; }
+int  ds4_gpu_decode_graph_patch_pre(int layer, uint32_t pos, uint32_t raw_row, uint32_t n_raw) {
+    (void)layer; (void)pos; (void)raw_row; (void)n_raw; return 0;
+}
+int  ds4_gpu_decode_graph_patch_post(int layer, uint32_t pos) { (void)layer; (void)pos; return 0; }
+int  ds4_gpu_decode_subgraph_launch(int part, int layer)      { (void)part; (void)layer; return 0; }
+int  ds4_gpu_decode_params_alloc(ds4_cuda_decode_params **host, void **device, uint64_t *bytes) {
+    (void)host; (void)device; (void)bytes; return 0;
+}
+void ds4_gpu_decode_params_free(ds4_cuda_decode_params *host, void *device, uint64_t bytes) {
+    (void)host; (void)device; (void)bytes;
+}
+int  ds4_gpu_decode_params_deactivate(void) { return 0; }
+
+int  ds4_gpu_pp_chunk_graph_capture_begin(int gpu) { (void)gpu; return 0; }
+int  ds4_gpu_pp_chunk_graph_capture_end(int gpu)   { (void)gpu; return 0; }
+int  ds4_gpu_pp_chunk_graph_capture_abort(int gpu) { (void)gpu; return 0; }
+int  ds4_gpu_pp_chunk_graph_launch(int gpu)        { (void)gpu; return 0; }
+
+/* --- Tensor-Parallel primitives (reached only when tp degree > 1). --- */
+int  ds4_gpu_matmul_q8_0_brange_tensor(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        uint64_t block_start, uint64_t block_end, int add_to,
+        const ds4_gpu_tensor *x) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset; (void)in_dim;
+    (void)out_dim; (void)block_start; (void)block_end; (void)add_to; (void)x; return 0;
+}
+int  ds4_gpu_tp_all_reduce_f32(const int *devs, int n, float *const *bufs, uint32_t n_floats) {
+    (void)devs; (void)n; (void)bufs; (void)n_floats; return 0;
+}
+int  ds4_gpu_tp_attention_output_low_q8_tensor(
+        ds4_gpu_tensor *low, const void *model_map,
+        uint64_t out_a_parent_offset, uint64_t rank, const ds4_gpu_tensor *heads) {
+    (void)low; (void)model_map; (void)out_a_parent_offset; (void)rank; (void)heads; return 0;
+}
+int  ds4_gpu_tp_col_matmul_tensor(ds4_gpu_tensor *out, const void *model_map,
+                                  uint64_t weight_offset, const ds4_gpu_tensor *x) {
+    (void)out; (void)model_map; (void)weight_offset; (void)x; return 0;
+}
+int  ds4_gpu_tp_row_matmul_tensor(ds4_gpu_tensor *out, const void *model_map,
+                                  uint64_t weight_offset, int add_to, const ds4_gpu_tensor *x) {
+    (void)out; (void)model_map; (void)weight_offset; (void)add_to; (void)x; return 0;
+}
+int  ds4_gpu_tp_ffn_jig(const void *model_map, uint64_t model_size,
+                        uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+                        uint64_t in_dim, uint64_t ff_dim, float clamp, int k) {
+    (void)model_map; (void)model_size; (void)gate_off; (void)up_off; (void)down_off;
+    (void)in_dim; (void)ff_dim; (void)clamp; (void)k; return 0;
+}
+int  ds4_gpu_tp_matmul_jig(const void *model_map, uint64_t model_size,
+                           uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, int k) {
+    (void)model_map; (void)model_size; (void)weight_offset; (void)in_dim; (void)out_dim; (void)k; return 0;
+}
+int  ds4_gpu_tp_oproj_jig(const void *model_map, uint64_t model_size,
+                          uint64_t out_a_off, uint64_t out_b_off,
+                          uint64_t group_dim, uint64_t rank, uint32_t n_groups,
+                          uint64_t n_embd, int k) {
+    (void)model_map; (void)model_size; (void)out_a_off; (void)out_b_off; (void)group_dim;
+    (void)rank; (void)n_groups; (void)n_embd; (void)k; return 0;
+}
+int  ds4_gpu_tp_resident_ffn_check(const void *model_map, uint64_t model_size,
+                                   uint64_t gate_off, uint64_t up_off, uint64_t down_off,
+                                   uint64_t in_dim, uint64_t ff_dim, float clamp,
+                                   int stage_dev0, int k) {
+    (void)model_map; (void)model_size; (void)gate_off; (void)up_off; (void)down_off;
+    (void)in_dim; (void)ff_dim; (void)clamp; (void)stage_dev0; (void)k; return 0;
+}
+int  ds4_gpu_tp_shard_jig(const void *model_map, uint64_t model_size,
+                          uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, int k) {
+    (void)model_map; (void)model_size; (void)weight_offset; (void)in_dim; (void)out_dim; (void)k; return 0;
+}
+int  ds4_gpu_tp_stage_dev0(int s) { (void)s; return 0; }
+
+/* --- GPU greedy argmax: opt-in via DS4_CUDA_GPU_ARGMAX. The default Metal
+ *     decode uses CPU sample_argmax over read-back logits, so this is not on
+ *     the hot path. Returning 0 makes the opt-in path fail loudly on Metal
+ *     rather than silently; a real Metal argmax kernel can replace this. --- */
+int  ds4_gpu_argmax_tensor(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores, uint32_t n_comp) {
+    (void)selected; (void)scores; (void)n_comp;
+    fprintf(stderr, "ds4: ds4_gpu_argmax_tensor not implemented on Metal "
+                    "(unset DS4_CUDA_GPU_ARGMAX to use CPU argmax)\n");
+    return 0;
+}
+
+/* --- PP decode-symbol trace helper (CUDA reads the device token and prints it;
+ *     only reached inside the PP encode path, which Metal never runs). --- */
+void ds4_debug_decode_symbol_token(const char *where, uint32_t host_token, uint32_t n_vocab) {
+    (void)where; (void)host_token; (void)n_vocab;
+}
+
 int ds4_gpu_attention_decode_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

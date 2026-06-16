@@ -1682,6 +1682,20 @@ static ds4_tensor *model_find_tensor(const ds4_model *m, const char *name) {
 }
 
 #ifndef DS4_NO_GPU
+/* Pure tensor-name substring test. Used both by the CUDA-only weight-residency
+ * helpers below and by the PP/TP sharding loop later in the file, which is only
+ * guarded by #ifndef DS4_NO_GPU (so it is compiled on Metal too). It must
+ * therefore sit outside the #ifndef __APPLE__ guard to stay visible to the
+ * Metal build; otherwise the Apple build fails with an implicit declaration. */
+static bool ds4_str_contains(ds4_str s, const char *z) {
+    size_t n = strlen(z);
+    if (s.len < n) return false;
+    for (uint64_t i = 0; i + n <= s.len; i++) {
+        if (memcmp(s.ptr + i, z, n) == 0) return true;
+    }
+    return false;
+}
+
 #ifndef __APPLE__
 typedef struct {
     uint64_t off;
@@ -1709,15 +1723,6 @@ static uint64_t accelerator_cuda_preload_span_bytes(void) {
     if (mb < 64) mb = 64;
     if (mb > 4096) mb = 4096;
     return mb * 1048576ull;
-}
-
-static bool ds4_str_contains(ds4_str s, const char *z) {
-    size_t n = strlen(z);
-    if (s.len < n) return false;
-    for (uint64_t i = 0; i + n <= s.len; i++) {
-        if (memcmp(s.ptr + i, z, n) == 0) return true;
-    }
-    return false;
 }
 
 static bool accelerator_cache_model_tensor_spans(const ds4_model *m, uint64_t *cached_out) {
