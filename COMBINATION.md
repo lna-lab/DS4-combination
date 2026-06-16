@@ -35,9 +35,10 @@
 - [x] Part 1-a: DSV4 payload **v1↔v2 整合**（emit=2, load は {1,2} 受理）。`ds4.c`。CUDA ビルドで検証済。
 - [x] (Mac) Metalビルド修正 — CUDA-only PP/TP/Graph で壊れていた Metal を green 化（`b3aa0df`）。
 - [x] Part 1-b: 橋CLI `--save-kv`/`--load-kv`/`--prefill-only`（`ds4_cli.c` の `run_kv_bridge`、バックエンド中立＝Metal安全）。CUDA build green。仕様＝`SPEC_KV_HANDOFF.md`。
-- [ ] Part 1-c: 10GbE 転送グルー（今は scp/rsync、将来 TCP 内蔵）。
-- [ ] Part 1-d (Mac): Metalビルド→Mac単機で save/load 往復自己テスト→CUDA産snapをload→decode。
-- [ ] 共有モデル: DATA1(Optane)へ `q2-q4-imatrix-fixed`(97.59GB) 取得中（layout parity）。
+- [x] Part 1-d (CUDA): **橋検証成功** — pure-IQ2 Flash で prefill→save→load→decode の出力が直接 prefill→decode と完全一致（save→load→decode == prefill→decode）。`--load-kv` 後の初手 sample も保存済み分布から正しく出る。
+- [ ] Part 1-d (Mac): Metalビルド→単機 save/load 自己テスト→**CUDA産 snapshot `bridge-test/cuda-iq2-quicksort.dsv4` を Metal で load→decode**（クロスバックエンド検証、返信2参照）。
+- [ ] Part 1-c: 10GbE 転送グルー（今は repo / scp、将来 TCP 内蔵）。
+- 共有モデル: **pure-IQ2 Flash `q2-imatrix`（IQ2XXS, 86.72GB）に確定**。q2-q4 は破棄（Q4K層がウチのCUDAで prefill 不可）。本命=**Pro IQ2 1.6T `pro-imatrix`(~430GB)**, Part 2 streaming の上で。両ノード q2-imatrix を使う。
 - [ ] Part 2: `SPEC_SSD_STREAMING_CUDA.md` に沿って CUDA SSD streaming 移植。
 - [ ] Part 3: distributed layer-pipeline。
 
