@@ -696,6 +696,21 @@ static cudaEvent_t g_stream_selected_stage_event[DS4_CUDA_MAX_DEVICES][4];
 static uint64_t g_stream_selected_stage_bytes[DS4_CUDA_MAX_DEVICES];
 static cudaStream_t g_stream_selected_upload_stream[DS4_CUDA_MAX_DEVICES];
 
+/* ===== GPU-side gather (Part 2 perf, behind DS4_STREAM_GPU_GATHER) =====
+ * Eliminate the per-layer host round-trip (cudaStreamSynchronize + D2H of the
+ * router-selected ids + host LRU scans + D2D compact copies) that caps streaming
+ * decode at ~8.7 t/s. A device directory mirrors the host LRU so the MoE kernel
+ * can read the resident expert buffers in place via a GPU-resolved slot index.
+ * d_expert_slot_dir[dev] = int32[MAX_LAYERS * n_total_expert], entry = LRU slot
+ * holding (layer_id, expert) or -1. layer_id is a small dense id keyed by
+ * gate_offset (the fork passes layer=0 from one_tensor, but gate_offset is
+ * unique per layer). Entirely ds4_cuda.cu-local; no ds4.c/Metal ABI change. */
+#define DS4_STREAM_GATHER_MAX_LAYERS 64u
+static int g_stream_gpu_gather = -1; /* -1=uninit; 0/1 resolved from env */
+static std::unordered_map<uint64_t, uint32_t> g_stream_gate_off_layerid;
+static int32_t *g_stream_expert_slot_dir[DS4_CUDA_MAX_DEVICES];
+static uint32_t g_stream_dir_experts[DS4_CUDA_MAX_DEVICES];
+
 /* Pipeline Parallelism (PP) state */
 static int g_pp_ngpu;
 static int g_pp_requested;
@@ -1868,6 +1883,12 @@ static void cuda_stream_expert_cache_release_all(void) {
     g_stream_expert_cache[dev].gate_capacity = 0;
     g_stream_expert_cache[dev].up_capacity = 0;
     g_stream_expert_cache[dev].down_capacity = 0;
+    /* GPU-gather: the LRU is gone, so drop its device directory too. */
+    if (g_stream_expert_slot_dir[dev]) {
+        (void)cudaFree(g_stream_expert_slot_dir[dev]);
+        g_stream_expert_slot_dir[dev] = NULL;
+        g_stream_dir_experts[dev] = 0;
+    }
 }
 
 static void cuda_stream_expert_cache_invalidate(void) {
@@ -1876,6 +1897,12 @@ static void cuda_stream_expert_cache_invalidate(void) {
     if (dev < 0 || dev >= DS4_CUDA_MAX_DEVICES) dev = 0;
     for (cuda_stream_expert_cache_slot &slot : g_stream_expert_cache[dev].slots) {
         slot.valid = 0;
+    }
+    /* GPU-gather: every slot just became invalid -> clear the device directory. */
+    if (g_stream_expert_slot_dir[dev]) {
+        (void)cudaMemset(g_stream_expert_slot_dir[dev], 0xFF,
+                         (size_t)DS4_STREAM_GATHER_MAX_LAYERS *
+                             g_stream_dir_experts[dev] * sizeof(int32_t));
     }
     g_stream_expert_cache[dev].valid = 0;
     g_stream_expert_cache[dev].count = 0;
@@ -2460,6 +2487,75 @@ static int cuda_stream_expert_cache_copy_to_compact(
                    "streaming selected down cache copy");
 }
 
+static int cuda_stream_gpu_gather_enabled(void) {
+    if (g_stream_gpu_gather < 0)
+        g_stream_gpu_gather = (getenv("DS4_STREAM_GPU_GATHER") != NULL) ? 1 : 0;
+    return g_stream_gpu_gather;
+}
+
+/* dense layer_id for a gate_offset (unique per layer); assigns on first sight. */
+static uint32_t cuda_stream_layerid(uint64_t gate_offset) {
+    auto it = g_stream_gate_off_layerid.find(gate_offset);
+    if (it != g_stream_gate_off_layerid.end()) return it->second;
+    uint32_t id = (uint32_t)g_stream_gate_off_layerid.size();
+    if (id >= DS4_STREAM_GATHER_MAX_LAYERS) id = DS4_STREAM_GATHER_MAX_LAYERS - 1u;
+    g_stream_gate_off_layerid[gate_offset] = id;
+    return id;
+}
+
+/* ensure the per-device slot directory exists for n_total_expert; init all -1. */
+static int cuda_stream_dir_ensure(int dev, uint32_t n_total_expert) {
+    if (dev < 0 || dev >= DS4_CUDA_MAX_DEVICES || n_total_expert == 0) return 0;
+    if (g_stream_expert_slot_dir[dev] && g_stream_dir_experts[dev] == n_total_expert) return 1;
+    if (g_stream_expert_slot_dir[dev]) {
+        (void)cudaFree(g_stream_expert_slot_dir[dev]);
+        g_stream_expert_slot_dir[dev] = NULL;
+    }
+    const size_t n = (size_t)DS4_STREAM_GATHER_MAX_LAYERS * n_total_expert;
+    if (!cuda_ok(cudaMalloc(&g_stream_expert_slot_dir[dev], n * sizeof(int32_t)),
+                 "stream gather dir alloc")) {
+        g_stream_expert_slot_dir[dev] = NULL;
+        return 0;
+    }
+    (void)cudaMemset(g_stream_expert_slot_dir[dev], 0xFF, n * sizeof(int32_t)); /* -1 */
+    g_stream_dir_experts[dev] = n_total_expert;
+    return 1;
+}
+
+/* one-thread write: clear an old (layer,expert) entry and set the new one.
+ * Indices are passed by value so there is no host-stack lifetime hazard. */
+__global__ static void cuda_stream_dir_write_kernel(int32_t *dir,
+                                                    int has_clear, uint32_t clear_idx,
+                                                    uint32_t set_idx, int32_t set_val) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        if (has_clear) dir[clear_idx] = -1;
+        dir[set_idx] = set_val;
+    }
+}
+
+/* mirror a load_slot into the device directory: clear the slot's previous
+ * (gate_offset,expert) key if it held one, then point (new gate_offset,expert)
+ * at this slot. Runs on the decode stream so it orders before the resolve. */
+static void cuda_stream_dir_update_load(int dev,
+                                        int old_valid, uint64_t old_gate_offset, uint32_t old_expert,
+                                        uint64_t new_gate_offset, uint32_t new_expert,
+                                        uint32_t slot) {
+    if (dev < 0 || dev >= DS4_CUDA_MAX_DEVICES || !g_stream_expert_slot_dir[dev]) return;
+    const uint32_t ne = g_stream_dir_experts[dev];
+    if (new_expert >= ne) return;
+    const uint32_t new_idx =
+        cuda_stream_layerid(new_gate_offset) * ne + new_expert;
+    int has_clear = 0;
+    uint32_t clear_idx = 0;
+    if (old_valid && old_expert < ne) {
+        has_clear = 1;
+        clear_idx = cuda_stream_layerid(old_gate_offset) * ne + old_expert;
+    }
+    cuda_stream_dir_write_kernel<<<1, 1, 0, ds4_decode_stream()>>>(
+        g_stream_expert_slot_dir[dev], has_clear, clear_idx, new_idx, (int32_t)slot);
+    (void)cudaGetLastError();
+}
+
 static int cuda_stream_expert_cache_load_slot(
         cuda_stream_expert_cache *cache,
         const void *model_map,
@@ -2502,6 +2598,11 @@ static int cuda_stream_expert_cache_load_slot(
         return 0;
     }
     cuda_stream_expert_cache_slot &entry = cache->slots[slot];
+    /* GPU-gather directory: capture the entry this slot previously held so we
+     * can clear its key before re-pointing it at the new (gate_offset,expert). */
+    const int      old_valid       = entry.valid;
+    const uint64_t old_gate_offset = entry.gate_offset;
+    const uint32_t old_expert      = entry.expert;
     entry.valid = 1;
     entry.model_map = model_map;
     entry.model_size = model_size;
@@ -2514,6 +2615,13 @@ static int cuda_stream_expert_cache_load_slot(
     entry.gate_expert_bytes = gate_expert_bytes;
     entry.down_expert_bytes = down_expert_bytes;
     entry.age = ++cache->tick;
+    if (cuda_stream_gpu_gather_enabled()) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (dev < 0 || dev >= DS4_CUDA_MAX_DEVICES) dev = 0;
+        cuda_stream_dir_update_load(dev, old_valid, old_gate_offset, old_expert,
+                                    gate_offset, expert, slot);
+    }
     return 1;
 }
 
