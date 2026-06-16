@@ -4668,7 +4668,10 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             gate_expert_bytes,
             down_expert_bytes,
             1,
-            0);
+            1 /* allow_global_cache: use the per-device resident expert LRU so
+                * decode reuses hot experts across tokens and skips the PCIe
+                * RAM->VRAM copy that the profile showed is ~67% of decode time.
+                * Was 0 (direct copy every token); see streaming decode profiling. */);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
