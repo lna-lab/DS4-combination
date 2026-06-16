@@ -2619,6 +2619,7 @@ static int cuda_stream_expert_cache_load_slot(
         int dev = 0;
         cudaGetDevice(&dev);
         if (dev < 0 || dev >= DS4_CUDA_MAX_DEVICES) dev = 0;
+        cuda_stream_dir_ensure(dev, n_total_expert);
         cuda_stream_dir_update_load(dev, old_valid, old_gate_offset, old_expert,
                                     gate_offset, expert, slot);
     }
